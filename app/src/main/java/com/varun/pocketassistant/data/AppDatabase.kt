@@ -8,7 +8,15 @@ import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.RoomDatabase
 import androidx.room.Update
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
+
+/** Structured skip reasons for segments (replaces free-text "superseded" matching). */
+object SkipReason {
+    const val SUPERSEDED = "superseded"
+    const val LEGACY_TOO_LONG = "legacy_too_long"
+}
 
 @Entity(tableName = "sessions")
 data class SessionEntity(
@@ -37,6 +45,9 @@ data class SegmentEntity(
     val asrProvider: String? = null,
     val cleanupProvider: String? = null,
     val meetingId: String? = null,
+    val asrLastError: String? = null,
+    val skipReason: String? = null,
+    val updatedAtMs: Long = 0L,
 )
 
 @Entity(tableName = "meetings")
@@ -50,6 +61,10 @@ data class MeetingEntity(
     val metadataJson: String? = null,
     val cleanupProvider: String? = null,
     val createdAtMs: Long = System.currentTimeMillis(),
+    /** Cleaned transcript text only (not assembled markdown). Enables summary-only retry. */
+    val cleanTextOnly: String? = null,
+    val lastError: String? = null,
+    val updatedAtMs: Long = 0L,
 )
 
 enum class TranscriptStatus {
@@ -211,9 +226,37 @@ interface MeetingDao {
     suspend fun delete(id: String)
 }
 
+val MIGRATION_4_5 = object : Migration(4, 5) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE segments ADD COLUMN asrLastError TEXT")
+        db.execSQL("ALTER TABLE segments ADD COLUMN skipReason TEXT")
+        db.execSQL("ALTER TABLE segments ADD COLUMN updatedAtMs INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE meetings ADD COLUMN cleanTextOnly TEXT")
+        db.execSQL("ALTER TABLE meetings ADD COLUMN lastError TEXT")
+        db.execSQL("ALTER TABLE meetings ADD COLUMN updatedAtMs INTEGER NOT NULL DEFAULT 0")
+        // Backfill skipReason from legacy free-text error channel.
+        db.execSQL(
+            """
+            UPDATE segments SET skipReason = 'superseded'
+            WHERE transcriptStatus = 'FAILED'
+              AND transcript IS NOT NULL
+              AND lower(transcript) LIKE '%superseded%'
+            """.trimIndent(),
+        )
+        db.execSQL(
+            """
+            UPDATE segments SET skipReason = 'legacy_too_long'
+            WHERE transcriptStatus = 'SKIPPED_SILENCE'
+              AND transcript IS NOT NULL
+              AND lower(transcript) LIKE '%mega wav%'
+            """.trimIndent(),
+        )
+    }
+}
+
 @Database(
     entities = [SessionEntity::class, SegmentEntity::class, MeetingEntity::class],
-    version = 4,
+    version = 5,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {

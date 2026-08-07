@@ -25,6 +25,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -35,9 +36,15 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import com.varun.pocketassistant.PocketAssistantApp
 import com.varun.pocketassistant.pipeline.CleanupPrompts
 import com.varun.pocketassistant.pipeline.OpenRouterModelInfo
@@ -177,7 +184,7 @@ fun PipelineSettingsScreen(onBack: () -> Unit) {
 
             Text("Routing", style = MaterialTheme.typography.titleLarge)
             Text(
-                "Each stage tries the preferred side first, then falls back if needed.",
+                "Pick Cloud or Local per stage. Fallback (below) is one switch for all stages.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -192,6 +199,31 @@ fun PipelineSettingsScreen(onBack: () -> Unit) {
 
             Text("Actions", style = MaterialTheme.typography.titleMedium)
             ModeRow(settings.actionsMode) { settings = settings.copy(actionsMode = it) }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text("Allow fallback", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        if (settings.allowFallback) {
+                            "If the primary side fails or is unavailable, try the other."
+                        } else {
+                            "Only the selected Cloud/Local side runs — no cross-fallback."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = settings.allowFallback,
+                    onCheckedChange = { settings = settings.copy(allowFallback = it) },
+                )
+            }
+
+            BatteryOptimizationRow()
 
             Text("OpenRouter", style = MaterialTheme.typography.titleLarge)
             Text(
@@ -419,7 +451,6 @@ fun PipelineSettingsScreen(onBack: () -> Unit) {
                             app.container.sessionRepository.requeueAllForAsr()
                         }
                         status = "Saved settings · re-queued recordings for ASR"
-                        app.container.transcriptionQueue.requeuePending()
                     }
                 },
                 modifier = Modifier.fillMaxWidth(),
@@ -441,7 +472,8 @@ fun PipelineSettingsScreen(onBack: () -> Unit) {
                     }
                     scope.launch {
                         withContext(Dispatchers.IO) {
-                            app.container.meetingProcessor.requeueAll()
+                            val ids = app.container.meetingRepository.requeueAllForCleanup(100)
+                            app.container.pipelineScheduler.requeuePendingMeetings(ids)
                         }
                         status = "Saved settings · re-queued all meetings for cleanup/summary"
                     }
@@ -668,6 +700,54 @@ private fun normalizeTemplate(value: String, default: String): String {
 }
 
 @Composable
+private fun BatteryOptimizationRow() {
+    val context = LocalContext.current
+    val pm = context.getSystemService(PowerManager::class.java)
+    var ignoring by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && pm != null) {
+                pm.isIgnoringBatteryOptimizations(context.packageName)
+            } else {
+                true
+            },
+        )
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+            Text("Unrestricted battery", style = MaterialTheme.typography.titleMedium)
+            Text(
+                if (ignoring) {
+                    "Battery optimisation is already disabled for this app."
+                } else {
+                    "Recommended so transcription can finish after recording stops."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (!ignoring) {
+            OutlinedButton(
+                onClick = {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                            data = Uri.parse("package:${context.packageName}")
+                        }
+                        runCatching { context.startActivity(intent) }
+                        ignoring = pm?.isIgnoringBatteryOptimizations(context.packageName) == true
+                    }
+                },
+            ) {
+                Text("Allow")
+            }
+        }
+    }
+}
+
+@Composable
 private fun ModeRow(selected: ProviderMode, onSelect: (ProviderMode) -> Unit) {
     Row(
         modifier = Modifier
@@ -678,12 +758,12 @@ private fun ModeRow(selected: ProviderMode, onSelect: (ProviderMode) -> Unit) {
         FilterChip(
             selected = selected == ProviderMode.PREFER_CLOUD,
             onClick = { onSelect(ProviderMode.PREFER_CLOUD) },
-            label = { Text("Cloud preferred") },
+            label = { Text("Cloud") },
         )
         FilterChip(
             selected = selected == ProviderMode.PREFER_LOCAL,
             onClick = { onSelect(ProviderMode.PREFER_LOCAL) },
-            label = { Text("Local preferred") },
+            label = { Text("Local") },
         )
     }
 }

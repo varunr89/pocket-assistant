@@ -8,20 +8,22 @@ import okhttp3.Request
 import org.json.JSONObject
 import java.net.InetAddress
 import java.net.UnknownHostException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
  * DNS that survives flaky Android/Wi‑Fi resolvers:
  * 1) system DNS
  * 2) Cloudflare DNS-over-HTTPS via https://1.1.1.1 (no DNS needed to reach it)
- * 3) static fallbacks for openrouter.ai
+ * 3) last known-good resolution cache (no hardcoded edge IPs)
  */
 object ResilientDns : Dns {
     private const val TAG = "ResilientDns"
+    private const val CACHE_TTL_MS = 30 * 60 * 1000L
 
-    private val staticFallback = mapOf(
-        "openrouter.ai" to listOf("104.18.2.115", "104.18.3.115"),
-    )
+    private data class Cached(val addresses: List<InetAddress>, val expiresAtMs: Long)
+
+    private val resolutionCache = ConcurrentHashMap<String, Cached>()
 
     /** Bootstrap client: resolve nothing via system DNS — talk to 1.1.1.1 by IP. */
     private val dohClient: OkHttpClient by lazy {
@@ -40,7 +42,10 @@ object ResilientDns : Dns {
         val host = hostname.trim().lowercase()
         try {
             val system = Dns.SYSTEM.lookup(host)
-            if (system.isNotEmpty()) return system
+            if (system.isNotEmpty()) {
+                cache(host, system)
+                return system
+            }
         } catch (e: UnknownHostException) {
             Log.w(TAG, "system DNS failed for $host: ${e.message}")
         }
@@ -49,23 +54,27 @@ object ResilientDns : Dns {
             val doh = lookupDoh(host)
             if (doh.isNotEmpty()) {
                 Log.i(TAG, "DoH resolved $host -> ${doh.joinToString { it.hostAddress ?: "?" }}")
+                cache(host, doh)
                 return doh
             }
         } catch (t: Throwable) {
             Log.w(TAG, "DoH failed for $host: ${t.message}")
         }
 
-        val fallback = staticFallback[host]
-        if (!fallback.isNullOrEmpty()) {
-            Log.w(TAG, "using static fallback for $host")
-            return fallback.map { InetAddress.getByName(it) }
+        val cached = resolutionCache[host]
+        if (cached != null && cached.expiresAtMs >= System.currentTimeMillis() && cached.addresses.isNotEmpty()) {
+            Log.w(TAG, "using cached resolution for $host")
+            return cached.addresses
         }
 
         throw UnknownHostException("Unable to resolve host \"$hostname\": no address associated with hostname")
     }
 
+    private fun cache(host: String, addresses: List<InetAddress>) {
+        resolutionCache[host] = Cached(addresses, System.currentTimeMillis() + CACHE_TTL_MS)
+    }
+
     private fun lookupDoh(hostname: String): List<InetAddress> {
-        // JSON DoH against Cloudflare by IP — works even when device DNS is broken.
         val url = "https://1.1.1.1/dns-query?name=$hostname&type=A".toHttpUrl()
         val request = Request.Builder()
             .url(url)

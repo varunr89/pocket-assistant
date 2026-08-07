@@ -48,6 +48,14 @@ class MainActivity : ComponentActivity() {
         val summaryMode = intent.getStringExtra(EXTRA_SUMMARY_MODE)
             ?.let { PipelineConfig.parseMode(it) }
             ?: cleanupMode
+        val allowFallback = when {
+            intent.hasExtra(EXTRA_ALLOW_FALLBACK) ->
+                intent.getBooleanExtra(EXTRA_ALLOW_FALLBACK, false)
+            PipelineConfig.legacyImpliesNoFallback(intent.getStringExtra(EXTRA_ASR_MODE)) ||
+                PipelineConfig.legacyImpliesNoFallback(intent.getStringExtra(EXTRA_CLEANUP_MODE)) ->
+                false
+            else -> cur.allowFallback
+        }
         val next = cur.copy(
             cloudApiKey = key,
             cloudBaseUrl = PipelineSettings.DEFAULT_BASE_URL,
@@ -70,6 +78,7 @@ class MainActivity : ComponentActivity() {
             cleanupMode = cleanupMode,
             summaryMode = summaryMode,
             actionsMode = summaryMode,
+            allowFallback = allowFallback,
             sttLanguage = intent.getStringExtra(EXTRA_STT_LANG)?.trim().orEmpty()
                 .ifBlank { cur.sttLanguage.ifBlank { "en" } },
         )
@@ -78,20 +87,21 @@ class MainActivity : ComponentActivity() {
             TAG,
             "Debug pipeline configured: asr=${next.cloudAsrModel} " +
                 "cleanup=${next.cloudCleanupModel} summary=${next.cloudSummaryModel} " +
-                "modes=${next.asrMode}/${next.cleanupMode}/${next.summaryMode}",
+                "modes=${next.asrMode}/${next.cleanupMode}/${next.summaryMode} " +
+                "fallback=${next.allowFallback}",
         )
 
         val scope = kotlinx.coroutines.CoroutineScope(Dispatchers.IO)
         if (intent.getBooleanExtra(EXTRA_REQUEUE_ASR, false)) {
             scope.launch {
                 app.container.sessionRepository.requeueAllForAsr()
-                app.container.transcriptionQueue.requeuePending()
                 Log.i(TAG, "Debug: requeued ASR")
             }
         }
         if (intent.getBooleanExtra(EXTRA_REQUEUE_MEETINGS, false)) {
             scope.launch {
-                app.container.meetingProcessor.requeuePending()
+                val ids = app.container.meetingRepository.getPendingCleanup(50).map { it.id }
+                app.container.pipelineScheduler.requeuePendingMeetings(ids)
                 Log.i(TAG, "Debug: requeued meetings")
             }
         }
@@ -109,6 +119,7 @@ class MainActivity : ComponentActivity() {
         const val EXTRA_ASR_MODE = "pipeline_asr_mode"
         const val EXTRA_CLEANUP_MODE = "pipeline_cleanup_mode"
         const val EXTRA_SUMMARY_MODE = "pipeline_summary_mode"
+        const val EXTRA_ALLOW_FALLBACK = "pipeline_allow_fallback"
         const val EXTRA_STT_LANG = "pipeline_stt_lang"
         const val EXTRA_REQUEUE_ASR = "pipeline_requeue_asr"
         const val EXTRA_REQUEUE_MEETINGS = "pipeline_requeue_meetings"

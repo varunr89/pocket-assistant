@@ -69,8 +69,8 @@ object AsrAudioPreprocessor {
         prepare(inputWav, outputDir, speed = CLOUD_SPEED)
 
     /**
-     * Split a 16 kHz mono PCM16 WAV into chunks of at most [maxDurationMs].
-     * Used so long cloud uploads stay under OpenRouter upstream timeouts (~10 min).
+     * Split a 16 kHz mono PCM16 WAV into chunks of at most [maxDurationMs],
+     * preferring the nearest silence gap to the target duration (avoids mid-word cuts).
      */
     fun splitByDurationMs(
         inputWav: File,
@@ -83,23 +83,55 @@ object AsrAudioPreprocessor {
         val maxSamples = (SAMPLE_RATE * maxDurationMs / 1000L).toInt().coerceAtLeast(1)
         if (pcm.size <= maxSamples) return listOf(inputWav)
         outputDir.mkdirs()
+        val silenceSearchRadius = (SAMPLE_RATE * 15).coerceAtMost(maxSamples / 4) // ±15s
         val out = ArrayList<File>()
         var offset = 0
         var idx = 0
         while (offset < pcm.size) {
-            val end = (offset + maxSamples).coerceAtMost(pcm.size)
-            val slice = pcm.copyOfRange(offset, end)
+            val remaining = pcm.size - offset
+            if (remaining <= maxSamples) {
+                val slice = pcm.copyOfRange(offset, pcm.size)
+                val file = File(
+                    outputDir,
+                    "asr_chunk_${inputWav.nameWithoutExtension}_${idx.toString().padStart(3, '0')}.wav",
+                )
+                writeWav(file, slice)
+                out += file
+                break
+            }
+            val targetEnd = offset + maxSamples
+            val splitAt = findNearestSilenceSplit(pcm, targetEnd, silenceSearchRadius)
+                .coerceIn(offset + maxSamples / 2, (offset + maxSamples).coerceAtMost(pcm.size))
+            val slice = pcm.copyOfRange(offset, splitAt)
             val file = File(
                 outputDir,
                 "asr_chunk_${inputWav.nameWithoutExtension}_${idx.toString().padStart(3, '0')}.wav",
             )
             writeWav(file, slice)
             out += file
-            offset = end
+            offset = splitAt
             idx++
         }
-        Log.i(TAG, "split ${inputWav.name} into ${out.size} chunks ≤${maxDurationMs}ms")
+        Log.i(TAG, "split ${inputWav.name} into ${out.size} chunks ≤${maxDurationMs}ms (silence-aware)")
         return out
+    }
+
+    /** Prefer a quiet frame near [targetSample]; fall back to [targetSample] if none. */
+    private fun findNearestSilenceSplit(pcm: ShortArray, targetSample: Int, radius: Int): Int {
+        val start = (targetSample - radius).coerceAtLeast(0)
+        val end = (targetSample + radius).coerceAtMost(pcm.size)
+        var best = targetSample.coerceIn(0, pcm.size)
+        var bestRms = Float.MAX_VALUE
+        var pos = start
+        while (pos + FRAME_SAMPLES <= end) {
+            val rms = frameRms(pcm, pos, FRAME_SAMPLES)
+            if (rms < SILENCE_RMS && rms < bestRms) {
+                bestRms = rms
+                best = pos + FRAME_SAMPLES
+            }
+            pos += FRAME_SAMPLES
+        }
+        return best.coerceIn(0, pcm.size)
     }
 
     private fun trimSilence(
@@ -260,8 +292,8 @@ object AsrAudioPreprocessor {
     const val DEFAULT_SPEED = 1.35f
     /** Cloud Whisper: silence only — speedup hurt WER in OpenRouter benches. */
     const val CLOUD_SPEED = 1.0f
-    /** OpenRouter STT: keep chunks near 10 minutes to avoid upstream 502/timeouts. */
-    const val CLOUD_CHUNK_MS = 600_000L
+    /** Upload chunk target (~2 min). Capture rolls stay at [CLOUD_MAX_SEGMENT_MS]. */
+    const val CLOUD_CHUNK_MS = 120_000L
     /** Capture roll interval when cloud ASR is preferred/required. */
     const val CLOUD_MAX_SEGMENT_MS = 600_000L
     /** Capture roll interval for local Parakeet. */

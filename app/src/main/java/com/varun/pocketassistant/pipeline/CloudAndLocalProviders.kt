@@ -34,15 +34,16 @@ import kotlin.coroutines.resumeWithException
  */
 class OpenAiCompatibleClient(
     private val config: PipelineConfig,
+    private val circuitBreaker: CloudCircuitBreaker? = null,
 ) {
     private val asrHttp: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .dns(ResilientDns)
             .connectTimeout(PipelineTelemetry.HTTP_CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .readTimeout(PipelineTelemetry.ASR_HTTP_READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            .writeTimeout(PipelineTelemetry.ASR_HTTP_READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            .callTimeout(PipelineTelemetry.ASR_HTTP_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            .retryOnConnectionFailure(true)
+            .writeTimeout(PipelineTelemetry.ASR_HTTP_WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            // No callTimeout — stalled sockets trip read/write; healthy slow uploads proceed.
+            .retryOnConnectionFailure(false)
             .build()
     }
 
@@ -51,16 +52,20 @@ class OpenAiCompatibleClient(
             .dns(ResilientDns)
             .connectTimeout(PipelineTelemetry.HTTP_CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .readTimeout(PipelineTelemetry.CHAT_HTTP_READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            .writeTimeout(PipelineTelemetry.CHAT_HTTP_READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .writeTimeout(PipelineTelemetry.CHAT_HTTP_WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .callTimeout(PipelineTelemetry.CHAT_HTTP_CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            .retryOnConnectionFailure(true)
+            .retryOnConnectionFailure(false)
             .build()
     }
 
     suspend fun transcribeAudio(wav: File): String {
         val settings = config.load()
         require(settings.cloudApiKey.isNotBlank()) { "Cloud API key not set" }
-        return withRetries(label = "Cloud ASR", host = hostOf(settings.cloudBaseUrl)) {
+        return withRetries(
+            label = "Cloud ASR",
+            host = hostOf(settings.cloudBaseUrl),
+            maxAttempts = PipelineTelemetry.ASR_HTTP_MAX_ATTEMPTS,
+        ) {
             if (settings.isOpenRouter() || wav.length() > MULTIPART_SAFE_BYTES) {
                 transcribeOpenRouterJson(wav, settings)
             } else {
@@ -70,24 +75,13 @@ class OpenAiCompatibleClient(
     }
 
     private suspend fun transcribeOpenRouterJson(wav: File, settings: PipelineSettings): String {
-        val bytes = wav.readBytes()
-        val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
         val format = wav.extension.lowercase().ifBlank { "wav" }
-        val payload = JSONObject()
-            .put("model", OpenRouterModels.normalizeId(settings.cloudAsrModel))
-            .put(
-                "input_audio",
-                JSONObject()
-                    .put("data", b64)
-                    .put("format", format),
-            )
-        val lang = settings.sttLanguage.trim()
-        if (lang.isNotEmpty()) payload.put("language", lang)
-
+        val model = OpenRouterModels.normalizeId(settings.cloudAsrModel)
+        val lang = settings.sttLanguage.trim().ifEmpty { null }
         val request = baseRequest(settings, "${settings.cloudBaseUrl.trimEnd('/')}/audio/transcriptions")
-            .post(payload.toString().toRequestBody(JSON))
+            .post(StreamingBase64AudioBody(wav, model, format, lang))
             .build()
-        Log.i(TAG, "ASR POST json bytes=${bytes.size} model=${settings.cloudAsrModel}")
+        Log.i(TAG, "ASR POST json stream bytes=${wav.length()} model=${settings.cloudAsrModel}")
         return readTranscriptionResponse(execute(asrHttp, request), "Cloud ASR")
     }
 
@@ -115,24 +109,32 @@ class OpenAiCompatibleClient(
         systemPrompt: String = DEFAULT_SYSTEM,
         model: String? = null,
         applyReasoning: Boolean = false,
+        stage: String = "chat",
     ): String {
         val settings = config.load()
         require(settings.cloudApiKey.isNotBlank()) { "Cloud API key not set" }
         val modelId = (model?.trim()?.ifBlank { null }
             ?: settings.cloudCleanupModel.ifBlank { PipelineSettings.DEFAULT_CLEANUP_MODEL })
             .let { OpenRouterModels.normalizeId(it) }
+        // Transport retries live here (with jitter). WorkManager retries the whole stage.
         return withRetries(
-            label = "Cloud chat model=$modelId inChars=${userPrompt.length}",
+            label = "Cloud $stage model=$modelId inChars=${userPrompt.length}",
             host = hostOf(settings.cloudBaseUrl),
-            maxAttempts = CHAT_MAX_ATTEMPTS,
+            maxAttempts = PipelineTelemetry.CHAT_HTTP_MAX_ATTEMPTS,
         ) {
-            chatOnce(
-                settings = settings,
-                modelId = modelId,
-                userPrompt = userPrompt,
-                systemPrompt = systemPrompt,
-                applyReasoning = applyReasoning,
-            )
+            PipelineTelemetry.timed(
+                stage,
+                "model=$modelId inChars=${userPrompt.length}",
+                timeoutMs = PipelineTelemetry.CHAT_ATTEMPT_TIMEOUT_MS,
+            ) {
+                chatOnce(
+                    settings = settings,
+                    modelId = modelId,
+                    userPrompt = userPrompt,
+                    systemPrompt = systemPrompt,
+                    applyReasoning = applyReasoning,
+                )
+            }
         }
     }
 
@@ -261,17 +263,22 @@ class OpenAiCompatibleClient(
         var last: Throwable? = null
         repeat(maxAttempts) { attempt ->
             try {
-                return block()
+                val result = block()
+                circuitBreaker?.recordSuccess()
+                return result
             } catch (t: Throwable) {
                 last = t
                 if (!isRetryable(t) || attempt == maxAttempts - 1) {
+                    circuitBreaker?.recordFailure()
                     throw humanizeNetworkError(label, host, t)
                 }
-                val delayMs = if (isDnsFailure(t)) {
+                val baseMs = if (isDnsFailure(t)) {
                     (2_000L * (attempt + 1)).coerceAtMost(8_000L)
                 } else {
                     (1_000L * (1 shl attempt)).coerceAtMost(6_000L)
                 }
+                val jitter = (baseMs * (0.2 + Math.random() * 0.3)).toLong()
+                val delayMs = baseMs + jitter
                 Log.w(
                     TAG,
                     "$label attempt ${attempt + 1}/$maxAttempts failed (${t.javaClass.simpleName}: ${t.message}); retry in ${delayMs}ms",
@@ -279,6 +286,7 @@ class OpenAiCompatibleClient(
                 delay(delayMs)
             }
         }
+        circuitBreaker?.recordFailure()
         throw humanizeNetworkError(label, host, last ?: error("$label failed"))
     }
 
@@ -290,8 +298,9 @@ class OpenAiCompatibleClient(
         private const val DEFAULT_SYSTEM =
             "You clean speech transcripts and summarize meetings. Output only the requested Markdown or text."
         private const val MAX_ATTEMPTS = 3
-        private const val CHAT_MAX_ATTEMPTS = 3
         private val JSON = "application/json; charset=utf-8".toMediaType()
+
+        fun isTransientTransportError(t: Throwable): Boolean = isRetryable(t)
 
         private fun hostOf(baseUrl: String): String {
             val trimmed = baseUrl.trim().trimEnd('/')
@@ -383,6 +392,48 @@ class OpenAiCompatibleClient(
     }
 }
 
+/**
+ * Streams OpenRouter JSON ASR body without materialising a ~51 MB base64 String.
+ */
+private class StreamingBase64AudioBody(
+    private val wav: File,
+    private val model: String,
+    private val format: String,
+    private val language: String?,
+) : okhttp3.RequestBody() {
+    override fun contentType() = "application/json; charset=utf-8".toMediaType()
+
+    override fun writeTo(sink: okio.BufferedSink) {
+        sink.writeUtf8("{\"model\":\"")
+        sink.writeUtf8(model)
+        sink.writeUtf8("\",\"input_audio\":{\"data\":\"")
+        wav.inputStream().use { input ->
+            // Encode in multiples of 3 bytes so NO_WRAP chunks concatenate cleanly.
+            val raw = ByteArray(3 * 8 * 1024)
+            while (true) {
+                var filled = 0
+                while (filled < raw.size) {
+                    val n = input.read(raw, filled, raw.size - filled)
+                    if (n < 0) break
+                    filled += n
+                }
+                if (filled <= 0) break
+                val chunk = if (filled == raw.size) raw else raw.copyOf(filled)
+                sink.writeUtf8(Base64.encodeToString(chunk, Base64.NO_WRAP))
+            }
+        }
+        sink.writeUtf8("\",\"format\":\"")
+        sink.writeUtf8(format)
+        sink.writeUtf8("\"}")
+        if (!language.isNullOrBlank()) {
+            sink.writeUtf8(",\"language\":\"")
+            sink.writeUtf8(language)
+            sink.writeUtf8("\"")
+        }
+        sink.writeUtf8("}")
+    }
+}
+
 class CloudAsrProvider(
     private val context: android.content.Context,
     private val config: PipelineConfig,
@@ -394,33 +445,72 @@ class CloudAsrProvider(
 
     override suspend fun transcribe(wav: File): AsrResult {
         val app = context.applicationContext
-        val prepDir = File(app.cacheDir, "cloud_asr_prep").also { it.mkdirs() }
-        // Bench: silence-only (no 1.35×) cut OpenRouter WER ~29% → ~20% on meeting parts.
-        val prep = AsrAudioPreprocessor.prepareForCloud(wav, prepDir)
-        if (prep.processedDurationMs <= 0L || prep.file.length() < 44 + 16_000) {
-            error("Cloud ASR: no speech left after silence trim")
-        }
-        val chunks = AsrAudioPreprocessor.splitByDurationMs(
-            inputWav = prep.file,
-            outputDir = prepDir,
-            maxDurationMs = AsrAudioPreprocessor.CLOUD_CHUNK_MS,
-        )
-        require(chunks.isNotEmpty()) { "Cloud ASR: empty chunk list" }
-        val parts = chunks.mapIndexed { i, chunk ->
-            Log.i(
-                "CloudAsr",
-                "chunk ${i + 1}/${chunks.size}: ${chunk.name} ${chunk.length()} bytes",
+        val prepDir = File(app.cacheDir, "cloud_asr_prep/${wav.nameWithoutExtension}_${System.nanoTime()}")
+            .also { it.mkdirs() }
+        try {
+            // Bench: silence-only (no 1.35×) cut OpenRouter WER ~29% → ~20% on meeting parts.
+            val prep = AsrAudioPreprocessor.prepareForCloud(wav, prepDir)
+            if (prep.processedDurationMs <= 0L || prep.file.length() < 44 + 16_000) {
+                // Not a transport failure — skip permanently rather than WorkManager-retry.
+                return AsrResult(plain = "", diarized = null, providerId = "$id:empty")
+            }
+            val chunks = AsrAudioPreprocessor.splitByDurationMs(
+                inputWav = prep.file,
+                outputDir = prepDir,
+                maxDurationMs = AsrAudioPreprocessor.CLOUD_CHUNK_MS,
             )
-            client.transcribeAudio(chunk).trim()
+            require(chunks.isNotEmpty()) { "Cloud ASR: empty chunk list" }
+
+            val n = chunks.size
+            val texts = arrayOfNulls<String>(n)
+            // HTTP retries live in withRetries. Failed chunks are skipped (partial OK).
+            for (i in 0 until n) {
+                val chunk = chunks[i]
+                Log.i(TAG, "chunk ${i + 1}/$n: ${chunk.name} ${chunk.length()} bytes")
+                try {
+                    val text = PipelineTelemetry.timed(
+                        "ASR",
+                        "chunk=${i + 1}/$n file=${chunk.name} bytes=${chunk.length()}",
+                        timeoutMs = PipelineTelemetry.ASR_CHUNK_TIMEOUT_MS,
+                    ) {
+                        client.transcribeAudio(chunk).trim()
+                    }
+                    if (text.isBlank()) {
+                        error("Cloud ASR returned empty transcript for chunk ${i + 1}")
+                    }
+                    texts[i] = text
+                } catch (t: Throwable) {
+                    Log.e(TAG, "chunk ${i + 1}/$n failed after HTTP retries: ${t.message}", t)
+                }
+            }
+
+            val ordered = (0 until n).mapNotNull { texts[it]?.takeIf { s -> s.isNotBlank() } }
+            val text = ordered.joinToString("\n\n")
+            val ok = ordered.size
+            val missed = n - ok
+            if (text.isBlank()) {
+                error("Cloud ASR: all $n chunk(s) failed")
+            }
+            if (missed > 0) {
+                Log.w(TAG, "partial transcript: $ok/$n chunks ok, $missed missed")
+            }
+            val model = config.load().cloudAsrModel
+            val suffix = buildString {
+                if (n > 1) append(":${n}ch")
+                if (missed > 0) append(":${missed}miss")
+            }
+            return AsrResult(
+                plain = text,
+                diarized = null,
+                providerId = "$id:$model$suffix",
+            )
+        } finally {
+            prepDir.deleteRecursively()
         }
-        val text = parts.filter { it.isNotBlank() }.joinToString("\n\n")
-        if (text.isBlank()) error("Cloud ASR returned empty transcript")
-        val model = config.load().cloudAsrModel
-        return AsrResult(
-            plain = text,
-            diarized = null,
-            providerId = "$id:$model${if (chunks.size > 1) ":${chunks.size}ch" else ""}",
-        )
+    }
+
+    companion object {
+        private const val TAG = "CloudAsr"
     }
 }
 
@@ -439,6 +529,7 @@ class CloudCleanupProvider(
             systemPrompt = "You clean speech transcripts. Output only the cleaned transcript text.",
             model = settings.cloudCleanupModel,
             applyReasoning = false,
+            stage = "cleanup",
         )
     }
 
@@ -449,6 +540,7 @@ class CloudCleanupProvider(
             systemPrompt = "You summarize meetings. Output only the requested Markdown sections.",
             model = settings.cloudSummaryModel,
             applyReasoning = true,
+            stage = "summary",
         )
     }
 
@@ -459,6 +551,7 @@ class CloudCleanupProvider(
             systemPrompt = system,
             model = settings.cloudSummaryModel,
             applyReasoning = true,
+            stage = "actions",
         )
     }
 }

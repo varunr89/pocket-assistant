@@ -154,11 +154,12 @@ class ParakeetAsrEngine(private val context: Context) : AutoCloseable {
         val overlapRatio = (overlap / modelInputInterval).toFloat()
         val startedAt = System.nanoTime()
 
-        val prepDir = File(appContext.cacheDir, "asr_prep").also { it.mkdirs() }
+        val prepDir = File(appContext.cacheDir, "asr_prep/${wav.nameWithoutExtension}_${System.nanoTime()}")
+            .also { it.mkdirs() }
         val prep = AsrAudioPreprocessor.prepare(wav, prepDir, speed = AsrAudioPreprocessor.DEFAULT_SPEED)
         if (prep.processedDurationMs < 400L) {
             Log.i(TAG, "Transcribe skip: too little speech after prep (${prep.processedDurationMs}ms)")
-            prep.file.delete()
+            prepDir.deleteRecursively()
             return ""
         }
 
@@ -240,7 +241,7 @@ class ParakeetAsrEngine(private val context: Context) : AutoCloseable {
                 }
             }
         } finally {
-            prep.file.delete()
+            prepDir.deleteRecursively()
         }
     }
 

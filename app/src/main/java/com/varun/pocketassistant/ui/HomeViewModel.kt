@@ -13,19 +13,27 @@ import com.varun.pocketassistant.data.MeetingEntity
 import com.varun.pocketassistant.data.OverlapPreview
 import com.varun.pocketassistant.data.SegmentEntity
 import com.varun.pocketassistant.data.SessionEntity
+import com.varun.pocketassistant.meeting.GapClusterer
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import java.util.concurrent.TimeUnit
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
 data class PlaybackState(
     val segmentId: String? = null,
     val isPlaying: Boolean = false,
 )
+
+enum class HomeBrowseMode { DAY, LIST }
 
 class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application as PocketAssistantApp
@@ -58,7 +66,119 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private val _createPreview = MutableStateFlow<OverlapPreview?>(null)
     val createPreview: StateFlow<OverlapPreview?> = _createPreview.asStateFlow()
 
+    private val _browseMode = MutableStateFlow(HomeBrowseMode.DAY)
+    val browseMode: StateFlow<HomeBrowseMode> = _browseMode.asStateFlow()
+
+    private val _dayStartMs = MutableStateFlow(startOfDayMs())
+    val dayStartMs: StateFlow<Long> = _dayStartMs.asStateFlow()
+
+    private val _daySegments = MutableStateFlow<List<SegmentEntity>>(emptyList())
+    val daySegments: StateFlow<List<SegmentEntity>> = _daySegments.asStateFlow()
+
+    private val _dayMeetings = MutableStateFlow<List<MeetingEntity>>(emptyList())
+    val dayMeetings: StateFlow<List<MeetingEntity>> = _dayMeetings.asStateFlow()
+
+    private val _proposals = MutableStateFlow<List<GapClusterer.Proposal>>(emptyList())
+    val proposals: StateFlow<List<GapClusterer.Proposal>> = _proposals.asStateFlow()
+
+    private val dismissedProposalIds = mutableSetOf<String>()
+
+    private val _selectionStartMs = MutableStateFlow<Long?>(null)
+    val selectionStartMs: StateFlow<Long?> = _selectionStartMs.asStateFlow()
+
+    private val _selectionEndMs = MutableStateFlow<Long?>(null)
+    val selectionEndMs: StateFlow<Long?> = _selectionEndMs.asStateFlow()
+
     private var mediaPlayer: MediaPlayer? = null
+
+    val allRecordings: StateFlow<List<SegmentEntity>> = repo.observeAllRecordings()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    init {
+        viewModelScope.launch {
+            combine(_dayStartMs, allRecordings, allMeetings) { day, _, _ -> day }
+                .collect { refreshDay(it) }
+        }
+    }
+
+    private suspend fun refreshDay(dayStart: Long) {
+        val dayEnd = dayStart + TimeUnit.DAYS.toMillis(1)
+        _daySegments.value = meetingRepo.getSegmentsOverlapping(dayStart, dayEnd)
+            .sortedBy { it.startedAtMs }
+        _dayMeetings.value = meetingRepo.getMeetingsOverlapping(dayStart, dayEnd)
+        // Drop proposals that no longer apply after assign/accept.
+        _proposals.value = _proposals.value.filter { p ->
+            p.id !in dismissedProposalIds &&
+                p.segmentIds.any { id ->
+                    _daySegments.value.any { it.id == id && it.meetingId == null }
+                }
+        }
+    }
+
+    fun setBrowseMode(mode: HomeBrowseMode) {
+        _browseMode.value = mode
+    }
+
+    fun shiftDay(deltaDays: Int) {
+        _dayStartMs.value += TimeUnit.DAYS.toMillis(deltaDays.toLong())
+        clearSelection()
+        _proposals.value = emptyList()
+    }
+
+    fun goToToday() {
+        _dayStartMs.value = startOfDayMs()
+        clearSelection()
+        _proposals.value = emptyList()
+    }
+
+    fun suggestMeetingsForDay() {
+        viewModelScope.launch {
+            val day = _dayStartMs.value
+            val dayEnd = day + TimeUnit.DAYS.toMillis(1)
+            val segs = meetingRepo.getSegmentsOverlapping(day, dayEnd)
+                .filter { it.meetingId == null }
+            val clustered = GapClusterer.cluster(segs)
+                .filter { it.id !in dismissedProposalIds }
+            _proposals.value = clustered
+        }
+    }
+
+    fun acceptProposal(proposal: GapClusterer.Proposal, onCreated: (String) -> Unit = {}) {
+        viewModelScope.launch {
+            val meeting = meetingRepo.createMeeting(proposal.startMs, proposal.endMs)
+            dismissedProposalIds += proposal.id
+            _proposals.value = _proposals.value.filter { it.id != proposal.id }
+            refreshDay(_dayStartMs.value)
+            onCreated(meeting.id)
+        }
+    }
+
+    fun dismissProposal(proposal: GapClusterer.Proposal) {
+        dismissedProposalIds += proposal.id
+        _proposals.value = _proposals.value.filter { it.id != proposal.id }
+    }
+
+    fun setTimelineSelection(startMs: Long?, endMs: Long?) {
+        _selectionStartMs.value = startMs
+        _selectionEndMs.value = endMs
+    }
+
+    fun clearSelection() {
+        _selectionStartMs.value = null
+        _selectionEndMs.value = null
+    }
+
+    fun createMeetingFromSelection(onCreated: (String) -> Unit) {
+        val a = _selectionStartMs.value ?: return
+        val b = _selectionEndMs.value ?: return
+        val start = min(a, b)
+        val end = max(a, b)
+        if (abs(end - start) < 60_000L) return
+        createMeeting(start, end) { id ->
+            clearSelection()
+            onCreated(id)
+        }
+    }
 
     fun setMeetingSearch(query: String) {
         _meetingSearch.value = query
@@ -130,6 +250,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     fun createMeeting(startMs: Long, endMs: Long, onCreated: (String) -> Unit) {
         viewModelScope.launch {
             val meeting = meetingRepo.createMeeting(startMs, endMs)
+            refreshDay(_dayStartMs.value)
             onCreated(meeting.id)
         }
     }
@@ -156,6 +277,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             if (_playback.value.segmentId == segmentId) stopPlayback()
             meetingRepo.assignRecording(segmentId, meetingId)
+            refreshDay(_dayStartMs.value)
         }
     }
 
@@ -171,6 +293,18 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             meetingRepo.deleteRecording(segmentId)
         }
     }
+
+    fun retranscribeRecording(segmentId: String) {
+        viewModelScope.launch {
+            repo.requeueForAsr(segmentId)
+        }
+    }
+
+    fun observeAsrAttempts(segmentId: String) =
+        app.container.pipelineScheduler.observeAsr(segmentId)
+
+    fun observeMeetingWork(meetingId: String) =
+        app.container.pipelineScheduler.observeMeeting(meetingId)
 
     fun togglePlayback(segment: SegmentEntity) {
         val current = _playback.value

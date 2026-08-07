@@ -54,7 +54,7 @@ import kotlin.math.sqrt
 fun EnrollVoiceScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val app = context.applicationContext as PocketAssistantApp
-    val store = app.container.transcriptionQueue.speakerStore()
+    val store = app.container.speakerStore
     val scope = rememberCoroutineScope()
 
     var status by remember {

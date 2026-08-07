@@ -74,7 +74,7 @@ class OrphanSessionImporter(
                 speechMs += durationMs
                 imported++
                 existing.add(wav.absolutePath)
-                repository.transcriptionQueue?.enqueue(segment.id)
+                repository.pipelineScheduler?.enqueueAsr(segment.id)
                 Log.i(TAG, "Queued orphan ${wav.name} (${wav.length()} bytes)")
             }
 

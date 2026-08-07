@@ -153,6 +153,13 @@ fun HomeScreen(
     val meetingSearch by viewModel.meetingSearch.collectAsState()
     val playback by viewModel.playback.collectAsState()
     val stats by viewModel.captureStats.collectAsState()
+    val browseMode by viewModel.browseMode.collectAsState()
+    val dayStartMs by viewModel.dayStartMs.collectAsState()
+    val daySegments by viewModel.daySegments.collectAsState()
+    val dayMeetings by viewModel.dayMeetings.collectAsState()
+    val proposals by viewModel.proposals.collectAsState()
+    val selectionStartMs by viewModel.selectionStartMs.collectAsState()
+    val selectionEndMs by viewModel.selectionEndMs.collectAsState()
 
     var permissionHint by remember { mutableStateOf<String?>(null) }
 
@@ -243,6 +250,46 @@ fun HomeScreen(
                 ObservabilityPanel(stats = stats)
 
                 Spacer(Modifier.height(28.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = browseMode == HomeBrowseMode.DAY,
+                        onClick = { viewModel.setBrowseMode(HomeBrowseMode.DAY) },
+                        label = { Text("Day") },
+                    )
+                    FilterChip(
+                        selected = browseMode == HomeBrowseMode.LIST,
+                        onClick = { viewModel.setBrowseMode(HomeBrowseMode.LIST) },
+                        label = { Text("List") },
+                    )
+                }
+                Spacer(Modifier.height(12.dp))
+
+                if (browseMode == HomeBrowseMode.DAY) {
+                    DayTimelinePanel(
+                        dayStartMs = dayStartMs,
+                        segments = daySegments,
+                        meetings = dayMeetings,
+                        proposals = proposals,
+                        selectionStartMs = selectionStartMs,
+                        selectionEndMs = selectionEndMs,
+                        onPrevDay = { viewModel.shiftDay(-1) },
+                        onNextDay = { viewModel.shiftDay(1) },
+                        onToday = viewModel::goToToday,
+                        onSuggest = viewModel::suggestMeetingsForDay,
+                        onAcceptProposal = { p ->
+                            viewModel.acceptProposal(p) { id -> onOpenMeeting(id) }
+                        },
+                        onDismissProposal = viewModel::dismissProposal,
+                        onOpenMeeting = onOpenMeeting,
+                        onSelectionChange = viewModel::setTimelineSelection,
+                        onCreateFromSelection = {
+                            viewModel.createMeetingFromSelection { id -> onOpenMeeting(id) }
+                        },
+                        onAssignSegment = { segmentId, meetingId ->
+                            viewModel.assignRecordingToMeeting(segmentId, meetingId)
+                        },
+                    )
+                } else {
                 Text("Meetings", style = MaterialTheme.typography.titleLarge)
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
@@ -304,9 +351,11 @@ fun HomeScreen(
                             },
                             onUnassign = null,
                             onDelete = { viewModel.deleteRecording(segment.id) },
+                            onRetranscribe = { viewModel.retranscribeRecording(segment.id) },
                         )
                         Spacer(Modifier.height(10.dp))
                     }
+                }
                 }
                 Spacer(Modifier.height(88.dp))
             }
@@ -587,9 +636,19 @@ fun MeetingDetailScreen(
             } else if (current.status == MeetingStatus.FAILED.name) {
                 Spacer(Modifier.height(16.dp))
                 Text(
-                    current.cleanedTranscript ?: "Cleanup failed",
+                    current.lastError
+                        ?: current.cleanedTranscript
+                        ?: "Cleanup failed",
                     color = MaterialTheme.colorScheme.error,
                 )
+                if (!current.cleanTextOnly.isNullOrBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Cleaned transcript kept — Retry will finish summary.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             } else if (current.status == MeetingStatus.READY.name &&
                 !current.cleanedTranscript.isNullOrBlank()
             ) {
@@ -633,6 +692,7 @@ fun MeetingDetailScreen(
                             },
                             onUnassign = { viewModel.unassignRecording(segment.id) },
                             onDelete = { viewModel.deleteRecording(segment.id) },
+                            onRetranscribe = { viewModel.retranscribeRecording(segment.id) },
                         )
                         Spacer(Modifier.height(10.dp))
                     }
@@ -714,6 +774,7 @@ private fun RecordingRow(
     onAssignToMeeting: ((String) -> Unit)? = null,
     onUnassign: (() -> Unit)? = null,
     onDelete: (() -> Unit)? = null,
+    onRetranscribe: (() -> Unit)? = null,
 ) {
     val formatter = remember {
         DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.MEDIUM)
@@ -723,6 +784,9 @@ private fun RecordingRow(
     }
     val raw = segment.diarizedTranscript?.takeIf { it.isNotBlank() }
         ?: segment.transcript?.takeIf { it.isNotBlank() }
+    val canRetranscribe = onRetranscribe != null &&
+        segment.transcriptStatus == "FAILED" &&
+        segment.skipReason == null
     var menuOpen by remember { mutableStateOf(false) }
     var assignOpen by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
@@ -754,12 +818,21 @@ private fun RecordingRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            if (onAssignToMeeting != null || onUnassign != null || onDelete != null) {
+            if (onAssignToMeeting != null || onUnassign != null || onDelete != null || canRetranscribe) {
                 Box {
                     IconButton(onClick = { menuOpen = true }) {
                         Icon(Icons.Default.MoreVert, contentDescription = "Recording actions")
                     }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        if (canRetranscribe) {
+                            DropdownMenuItem(
+                                text = { Text("Retranscribe") },
+                                onClick = {
+                                    menuOpen = false
+                                    onRetranscribe?.invoke()
+                                },
+                            )
+                        }
                         if (onAssignToMeeting != null) {
                             DropdownMenuItem(
                                 text = {
@@ -804,7 +877,7 @@ private fun RecordingRow(
             )
         }
         when {
-            showRaw && !raw.isNullOrBlank() -> {
+            showRaw && !raw.isNullOrBlank() && segment.transcriptStatus != "FAILED" -> {
                 Spacer(Modifier.height(8.dp))
                 Text(
                     raw,
@@ -817,7 +890,11 @@ private fun RecordingRow(
                 segment.transcriptStatus == "PROCESSING" -> {
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "Transcribing…",
+                    if (segment.asrLastError != null) {
+                        "Retrying transcription… (${segment.asrLastError})"
+                    } else {
+                        "Transcribing…"
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.secondary,
                 )
@@ -833,10 +910,21 @@ private fun RecordingRow(
             segment.transcriptStatus == "FAILED" -> {
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    segment.diarizedTranscript ?: "Transcription failed",
+                    segment.asrLastError
+                        ?: segment.diarizedTranscript
+                        ?: "Transcription failed",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.error,
                 )
+                if (canRetranscribe) {
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = { onRetranscribe?.invoke() },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Retranscribe")
+                    }
+                }
             }
         }
     }

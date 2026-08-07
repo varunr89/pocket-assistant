@@ -2,7 +2,7 @@ package com.varun.pocketassistant.data
 
 import com.varun.pocketassistant.capture.AudioStorage
 import com.varun.pocketassistant.capture.RetentionPolicy
-import com.varun.pocketassistant.speech.TranscriptionQueue
+import com.varun.pocketassistant.pipeline.work.PipelineScheduler
 import kotlinx.coroutines.flow.Flow
 import java.io.File
 import java.util.UUID
@@ -20,7 +20,7 @@ class SessionRepository(
     private val retentionPolicy: RetentionPolicy,
 ) {
     @Volatile
-    var transcriptionQueue: TranscriptionQueue? = null
+    var pipelineScheduler: PipelineScheduler? = null
 
     fun observeSessions(): Flow<List<SessionEntity>> = sessionDao.observeSessions()
 
@@ -42,13 +42,18 @@ class SessionRepository(
     suspend fun getPendingWork(limit: Int): List<SegmentEntity> {
         // Reclaim interrupted jobs left in PROCESSING after process death.
         segmentDao.getByTranscriptStatus(TranscriptStatus.PROCESSING.name, limit).forEach { seg ->
-            segmentDao.update(seg.copy(transcriptStatus = TranscriptStatus.PENDING.name))
+            segmentDao.update(
+                seg.copy(
+                    transcriptStatus = TranscriptStatus.PENDING.name,
+                    updatedAtMs = System.currentTimeMillis(),
+                ),
+            )
         }
         return segmentDao.getNeedingAsr(
             TranscriptStatus.PENDING.name,
             TranscriptStatus.FAILED.name,
             limit,
-        )
+        ).filter { it.skipReason == null }
     }
 
     suspend fun startSession(): SessionEntity {
@@ -86,6 +91,7 @@ class SessionRepository(
         startedAtMs: Long,
         endedAtMs: Long,
     ): SegmentEntity {
+        val now = System.currentTimeMillis()
         val segment = SegmentEntity(
             id = UUID.randomUUID().toString(),
             sessionId = sessionId,
@@ -95,6 +101,7 @@ class SessionRepository(
             durationMs = endedAtMs - startedAtMs,
             byteSize = file.length(),
             transcriptStatus = TranscriptStatus.PENDING.name,
+            updatedAtMs = now,
         )
         segmentDao.insert(segment)
 
@@ -107,7 +114,7 @@ class SessionRepository(
                 ),
             )
         }
-        transcriptionQueue?.enqueue(segment.id)
+        pipelineScheduler?.enqueueAsr(segment.id)
         return segment
     }
 
@@ -119,6 +126,9 @@ class SessionRepository(
         cleaned: String? = null,
         asrProvider: String? = null,
         cleanupProvider: String? = null,
+        asrLastError: String? = null,
+        skipReason: String? = null,
+        clearAsrError: Boolean = false,
     ) {
         val current = segmentDao.getById(segmentId) ?: return
         segmentDao.update(
@@ -129,6 +139,13 @@ class SessionRepository(
                 cleanedTranscript = cleaned ?: current.cleanedTranscript,
                 asrProvider = asrProvider ?: current.asrProvider,
                 cleanupProvider = cleanupProvider ?: current.cleanupProvider,
+                asrLastError = when {
+                    clearAsrError -> null
+                    asrLastError != null -> asrLastError
+                    else -> current.asrLastError
+                },
+                skipReason = skipReason ?: current.skipReason,
+                updatedAtMs = System.currentTimeMillis(),
             ),
         )
     }
@@ -143,6 +160,7 @@ class SessionRepository(
             segmentDao.getByTranscriptStatus(TranscriptStatus.CLEAN_FAILED.name, 100) +
             segmentDao.getByTranscriptStatus(TranscriptStatus.PROCESSING.name, 100)
         segs.distinctBy { it.id }.forEach { seg ->
+            if (seg.skipReason != null) return@forEach
             segmentDao.update(
                 seg.copy(
                     transcriptStatus = TranscriptStatus.PENDING.name,
@@ -151,10 +169,32 @@ class SessionRepository(
                     cleanedTranscript = null,
                     asrProvider = null,
                     cleanupProvider = null,
+                    asrLastError = null,
+                    updatedAtMs = System.currentTimeMillis(),
                 ),
             )
-            transcriptionQueue?.enqueue(seg.id)
+            pipelineScheduler?.enqueueAsr(seg.id)
         }
+    }
+
+    /** Reset one recording and enqueue ASR again (e.g. after a failed transcription). */
+    suspend fun requeueForAsr(segmentId: String): Boolean {
+        val seg = segmentDao.getById(segmentId) ?: return false
+        if (seg.skipReason != null) return false
+        segmentDao.update(
+            seg.copy(
+                transcriptStatus = TranscriptStatus.PENDING.name,
+                transcript = null,
+                diarizedTranscript = null,
+                cleanedTranscript = null,
+                asrProvider = null,
+                cleanupProvider = null,
+                asrLastError = null,
+                updatedAtMs = System.currentTimeMillis(),
+            ),
+        )
+        pipelineScheduler?.enqueueAsr(segmentId, replace = true)
+        return true
     }
 
     suspend fun deleteSession(sessionId: String) {

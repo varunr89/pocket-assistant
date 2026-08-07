@@ -1,6 +1,7 @@
 package com.varun.pocketassistant.pipeline
 
 import java.io.File
+import kotlinx.coroutines.CancellationException
 
 data class AsrResult(
     val plain: String,
@@ -42,31 +43,27 @@ class ProviderRouter(
     private val cloudAsr: AsrProvider,
     private val localText: MeetingTextProvider,
     private val cloudText: MeetingTextProvider,
+    private val circuitBreaker: CloudCircuitBreaker? = null,
 ) {
     suspend fun transcribe(wav: File): AsrResult {
         val settings = config.load()
         val detailBase = "file=${wav.name} bytes=${wav.length()}"
         return route(
             mode = settings.asrMode,
+            allowFallback = settings.allowFallback,
             localAvailable = localAsr.isAvailable(),
-            cloudAvailable = cloudAsr.isAvailable(),
+            cloudAvailable = cloudAsr.isAvailable() && (circuitBreaker?.isHealthy() != false),
             runLocal = {
                 PipelineTelemetry.timed(
                     "ASR",
                     "$detailBase provider=${localAsr.id}",
-                    timeoutMs = PipelineTelemetry.ASR_TIMEOUT_MS,
+                    timeoutMs = PipelineTelemetry.ASR_CHUNK_TIMEOUT_MS,
                 ) {
                     localAsr.transcribe(wav)
                 }
             },
             runCloud = {
-                PipelineTelemetry.timed(
-                    "ASR",
-                    "$detailBase provider=${cloudAsr.id}",
-                    timeoutMs = PipelineTelemetry.ASR_TIMEOUT_MS,
-                ) {
-                    cloudAsr.transcribe(wav)
-                }
+                cloudAsr.transcribe(wav)
             },
             stage = "ASR",
         )
@@ -77,8 +74,9 @@ class ProviderRouter(
         val detailBase = "inChars=${raw.length} diarized=$diarized"
         return route(
             mode = settings.cleanupMode,
+            allowFallback = settings.allowFallback,
             localAvailable = localText.isAvailable(),
-            cloudAvailable = cloudText.isAvailable(),
+            cloudAvailable = cloudText.isAvailable() && (circuitBreaker?.isHealthy() != false),
             runLocal = {
                 PipelineTelemetry.timed(
                     "cleanup",
@@ -92,16 +90,10 @@ class ProviderRouter(
                 }
             },
             runCloud = {
-                PipelineTelemetry.timed(
-                    "cleanup",
-                    "$detailBase provider=${cloudText.id} model=${settings.cloudCleanupModel}",
-                    timeoutMs = PipelineTelemetry.CHAT_TIMEOUT_MS,
-                ) {
-                    TextStageResult(
-                        text = cloudText.cleanTranscript(raw, diarized),
-                        providerId = cloudText.id,
-                    )
-                }
+                TextStageResult(
+                    text = cloudText.cleanTranscript(raw, diarized),
+                    providerId = cloudText.id,
+                )
             },
             stage = "cleanup",
         )
@@ -112,8 +104,9 @@ class ProviderRouter(
         val detailBase = "inChars=${cleanedTranscript.length}"
         return route(
             mode = settings.summaryMode,
+            allowFallback = settings.allowFallback,
             localAvailable = localText.isAvailable(),
-            cloudAvailable = cloudText.isAvailable(),
+            cloudAvailable = cloudText.isAvailable() && (circuitBreaker?.isHealthy() != false),
             runLocal = {
                 PipelineTelemetry.timed(
                     "summary",
@@ -127,16 +120,10 @@ class ProviderRouter(
                 }
             },
             runCloud = {
-                PipelineTelemetry.timed(
-                    "summary",
-                    "$detailBase provider=${cloudText.id} model=${settings.cloudSummaryModel}",
-                    timeoutMs = PipelineTelemetry.CHAT_TIMEOUT_MS,
-                ) {
-                    TextStageResult(
-                        text = cloudText.summarize(cleanedTranscript),
-                        providerId = cloudText.id,
-                    )
-                }
+                TextStageResult(
+                    text = cloudText.summarize(cleanedTranscript),
+                    providerId = cloudText.id,
+                )
             },
             stage = "summary",
         )
@@ -151,8 +138,9 @@ class ProviderRouter(
         val detailBase = "inChars=${prompt.length}"
         return route(
             mode = settings.actionsMode,
+            allowFallback = settings.allowFallback,
             localAvailable = localText.isAvailable(),
-            cloudAvailable = cloudText.isAvailable(),
+            cloudAvailable = cloudText.isAvailable() && (circuitBreaker?.isHealthy() != false),
             runLocal = {
                 PipelineTelemetry.timed(
                     "actions",
@@ -166,16 +154,10 @@ class ProviderRouter(
                 }
             },
             runCloud = {
-                PipelineTelemetry.timed(
-                    "actions",
-                    "$detailBase provider=${cloudText.id} model=${settings.cloudSummaryModel}",
-                    timeoutMs = PipelineTelemetry.CHAT_TIMEOUT_MS,
-                ) {
-                    TextStageResult(
-                        text = cloudText.prompt(system, prompt),
-                        providerId = cloudText.id,
-                    )
-                }
+                TextStageResult(
+                    text = cloudText.prompt(system, prompt),
+                    providerId = cloudText.id,
+                )
             },
             stage = "actions",
         )
@@ -183,6 +165,7 @@ class ProviderRouter(
 
     private suspend fun <T> route(
         mode: ProviderMode,
+        allowFallback: Boolean,
         localAvailable: Boolean,
         cloudAvailable: Boolean,
         runLocal: suspend () -> T,
@@ -190,52 +173,48 @@ class ProviderRouter(
         stage: String,
     ): T {
         fun fail(msg: String): Nothing = error("$stage: $msg")
-        return when (mode) {
-            ProviderMode.PREFER_LOCAL -> {
-                if (localAvailable) {
-                    runCatching { runLocal() }.getOrElse { localErr ->
-                        if (!cloudAvailable) throw localErr
-                        android.util.Log.w(TAG, "$stage local failed, falling back to cloud", localErr)
-                        runCloud()
-                    }
-                } else if (cloudAvailable) {
-                    runCloud()
-                } else {
-                    fail("no local or cloud provider available")
+        val primaryIsCloud = mode == ProviderMode.PREFER_CLOUD
+        val primaryAvailable = if (primaryIsCloud) cloudAvailable else localAvailable
+        val secondaryAvailable = if (primaryIsCloud) localAvailable else cloudAvailable
+        val runPrimary = if (primaryIsCloud) runCloud else runLocal
+        val runSecondary = if (primaryIsCloud) runLocal else runCloud
+        val primaryLabel = if (primaryIsCloud) "cloud" else "local"
+        val secondaryLabel = if (primaryIsCloud) "local" else "cloud"
+
+        if (primaryAvailable) {
+            try {
+                return runPrimary()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (primaryErr: Throwable) {
+                // Only fall back for non-transient failures after transport retries are exhausted.
+                // A 502 must not divert to slow local Gemma.
+                if (!allowFallback ||
+                    !secondaryAvailable ||
+                    OpenAiCompatibleClient.isTransientTransportError(primaryErr)
+                ) {
+                    throw primaryErr
                 }
-            }
-            ProviderMode.PREFER_CLOUD -> {
-                if (cloudAvailable) {
-                    runCatching { runCloud() }.getOrElse { cloudErr ->
-                        // ASR may fall back to on-device; text stages fail loudly so we don't
-                        // hang on a local LLM after a cloud error (and so the UI shows why).
-                        if (stage == "ASR" && localAvailable) {
-                            android.util.Log.w(
-                                TAG,
-                                "$stage cloud failed (${cloudErr.message}), falling back to local",
-                                cloudErr,
-                            )
-                            runLocal()
-                        } else {
-                            android.util.Log.e(
-                                TAG,
-                                "$stage cloud failed (${cloudErr.message}) — not falling back to local",
-                                cloudErr,
-                            )
-                            throw cloudErr
-                        }
-                    }
-                } else if (localAvailable) {
-                    android.util.Log.w(
-                        TAG,
-                        "$stage prefer cloud but cloud unavailable (save OpenRouter API key?) — using local",
-                    )
-                    runLocal()
-                } else {
-                    fail("no cloud or local provider available")
-                }
+                android.util.Log.w(
+                    TAG,
+                    "$stage $primaryLabel failed non-transient (${primaryErr.message}), " +
+                        "falling back to $secondaryLabel",
+                    primaryErr,
+                )
+                return runSecondary()
             }
         }
+        if (allowFallback && secondaryAvailable) {
+            android.util.Log.w(
+                TAG,
+                "$stage $primaryLabel unavailable — using $secondaryLabel",
+            )
+            return runSecondary()
+        }
+        if (!primaryAvailable && !secondaryAvailable) {
+            fail("no local or cloud provider available")
+        }
+        fail("$primaryLabel unavailable (enable fallback or configure the other side)")
     }
 
     companion object {

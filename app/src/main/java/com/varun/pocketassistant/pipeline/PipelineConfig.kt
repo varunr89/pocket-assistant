@@ -6,7 +6,8 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 
 /**
- * Which side to try first. Always falls back to the other when available.
+ * Primary side for a pipeline stage. Pair with [PipelineSettings.allowFallback]
+ * for the 2×2: Cloud/Local × fallback on/off.
  */
 enum class ProviderMode {
     PREFER_CLOUD,
@@ -19,6 +20,11 @@ data class PipelineSettings(
     val summaryMode: ProviderMode = ProviderMode.PREFER_CLOUD,
     /** Reserved for future meeting actions / follow-ups. */
     val actionsMode: ProviderMode = ProviderMode.PREFER_CLOUD,
+    /**
+     * When true, if the primary side fails (or is unavailable), try the other side.
+     * When false, only the selected Cloud/Local side is used.
+     */
+    val allowFallback: Boolean = false,
     val cloudBaseUrl: String = DEFAULT_BASE_URL,
     val cloudApiKey: String = "",
     val cloudAsrModel: String = DEFAULT_ASR_MODEL,
@@ -112,6 +118,7 @@ class PipelineConfig(context: Context) {
         actionsMode = parseMode(prefs.getString(KEY_ACTIONS_MODE, null)
             ?: prefs.getString(KEY_SUMMARY_MODE, null)
             ?: prefs.getString(KEY_CLEANUP_MODE, null)),
+        allowFallback = prefs.getBoolean(KEY_ALLOW_FALLBACK, false),
         cloudBaseUrl = PipelineSettings.DEFAULT_BASE_URL,
         cloudApiKey = prefs.getString(KEY_API_KEY, null).orEmpty(),
         cloudAsrModel = OpenRouterModels.normalizeId(
@@ -143,6 +150,7 @@ class PipelineConfig(context: Context) {
             putString(KEY_CLEANUP_MODE, settings.cleanupMode.name)
             putString(KEY_SUMMARY_MODE, settings.summaryMode.name)
             putString(KEY_ACTIONS_MODE, settings.actionsMode.name)
+            putBoolean(KEY_ALLOW_FALLBACK, settings.allowFallback)
             putString(KEY_BASE_URL, PipelineSettings.DEFAULT_BASE_URL)
             putString(KEY_API_KEY, settings.cloudApiKey.trim())
             putString(KEY_ASR_MODEL, OpenRouterModels.normalizeId(settings.cloudAsrModel))
@@ -171,6 +179,7 @@ class PipelineConfig(context: Context) {
         private const val KEY_CLEANUP_MODE = "cleanup_mode"
         private const val KEY_SUMMARY_MODE = "summary_mode"
         private const val KEY_ACTIONS_MODE = "actions_mode"
+        private const val KEY_ALLOW_FALLBACK = "allow_fallback"
         private const val KEY_BASE_URL = "cloud_base_url"
         private const val KEY_API_KEY = "cloud_api_key"
         private const val KEY_ASR_MODEL = "cloud_asr_model"
@@ -187,7 +196,7 @@ class PipelineConfig(context: Context) {
         private const val KEY_SUMMARY_PROMPT = "summary_prompt"
         private const val KEY_GLOSSARY = "glossary"
 
-        /** Maps legacy ONLY_* values onto the two prefer modes. */
+        /** Maps legacy ONLY_* / PREFER_* onto [ProviderMode]. Fallback is a separate flag. */
         fun parseMode(raw: String?): ProviderMode =
             when (raw) {
                 null, "" -> ProviderMode.PREFER_CLOUD
@@ -195,5 +204,9 @@ class PipelineConfig(context: Context) {
                 "ONLY_LOCAL", ProviderMode.PREFER_LOCAL.name -> ProviderMode.PREFER_LOCAL
                 else -> runCatching { ProviderMode.valueOf(raw) }.getOrDefault(ProviderMode.PREFER_CLOUD)
             }
+
+        /** True when a legacy ONLY_* mode string implied no fallback. */
+        fun legacyImpliesNoFallback(raw: String?): Boolean =
+            raw == "ONLY_CLOUD" || raw == "ONLY_LOCAL"
     }
 }
