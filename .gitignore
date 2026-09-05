@@ -16,3 +16,7 @@ captures/
 *.class
 *.log
 .cursor/
+
+# Local-only large binary artifacts (already on disk; not source)
+phone-data-backup/
+phone-apk/
