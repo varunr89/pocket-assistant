@@ -463,10 +463,11 @@ class CloudAsrProvider(
 
             val n = chunks.size
             val texts = arrayOfNulls<String>(n)
+            val chunkErrors = Array<String?>(n) { null }
             // HTTP retries live in withRetries. Failed chunks are skipped (partial OK).
             for (i in 0 until n) {
                 val chunk = chunks[i]
-                Log.i(TAG, "chunk ${i + 1}/$n: ${chunk.name} ${chunk.length()} bytes")
+                Log.i(TAG, "chunk ${i + 1}/$n: ${chunk.name} ${chunk.length()} bytes (${chunk.length() * 8L / 16_000L / 1000L}s audio)")
                 try {
                     val text = PipelineTelemetry.timed(
                         "ASR",
@@ -480,7 +481,9 @@ class CloudAsrProvider(
                     }
                     texts[i] = text
                 } catch (t: Throwable) {
-                    Log.e(TAG, "chunk ${i + 1}/$n failed after HTTP retries: ${t.message}", t)
+                    // Persist the REAL reason — currently discarded (root cause of opacity).
+                    chunkErrors[i] = t.message ?: t.javaClass.simpleName
+                    Log.e(TAG, "chunk ${i + 1}/$n failed after HTTP retries: ${chunkErrors[i]}", t)
                 }
             }
 
@@ -489,7 +492,14 @@ class CloudAsrProvider(
             val ok = ordered.size
             val missed = n - ok
             if (text.isBlank()) {
-                error("Cloud ASR: all $n chunk(s) failed")
+                // Surface the actual failure detail + sizing instead of a bare count.
+                val example = chunkErrors.firstOrNull { !it.isNullOrBlank() } ?: "no detail"
+                val totalBytes = chunks.sumOf { it.length() }
+                val totalSec = totalBytes * 8L / 16_000L / 1000L
+                error(
+                    "Cloud ASR: all $n chunk(s) failed (file ~${totalSec}s, $n chunk(s) of " +
+                        "~${AsrAudioPreprocessor.CLOUD_CHUNK_MS / 1000}s). First error: $example",
+                )
             }
             if (missed > 0) {
                 Log.w(TAG, "partial transcript: $ok/$n chunks ok, $missed missed")
