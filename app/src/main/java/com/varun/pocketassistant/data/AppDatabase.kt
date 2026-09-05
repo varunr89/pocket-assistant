@@ -48,6 +48,12 @@ data class SegmentEntity(
     val asrLastError: String? = null,
     val skipReason: String? = null,
     val updatedAtMs: Long = 0L,
+    /** JSON of diarization speaker candidates. */
+    val speakerCandidatesJson: String? = null,
+    /** User confirmed this segment is "you" speaking. */
+    val youConfirmed: Boolean = false,
+    /** Structured end reason (e.g. duration_cap). */
+    val endReason: String? = null,
 )
 
 @Entity(tableName = "meetings")
@@ -254,9 +260,52 @@ val MIGRATION_4_5 = object : Migration(4, 5) {
     }
 }
 
+val MIGRATION_5_6 = object : Migration(5, 6) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE segments ADD COLUMN speakerCandidatesJson TEXT")
+        db.execSQL("ALTER TABLE segments ADD COLUMN youConfirmed INTEGER NOT NULL DEFAULT 0")
+    }
+}
+
+val MIGRATION_6_7 = object : Migration(6, 7) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE segments ADD COLUMN endReason TEXT")
+        backfillDurationCapEndReason(db)
+    }
+}
+
+val MIGRATION_7_8 = object : Migration(7, 8) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        backfillDurationCapEndReason(db)
+    }
+}
+
+/**
+ * Backfill `endReason = duration_cap` for segments that were cut short by the
+ * max-duration cap (>= 105000 ms) and followed immediately by another segment
+ * in the same session.
+ */
+private fun backfillDurationCapEndReason(db: SupportSQLiteDatabase) {
+    db.execSQL(
+        """
+        UPDATE segments SET endReason = 'duration_cap'
+        WHERE endReason IS NULL
+          AND durationMs >= 105000
+          AND EXISTS (
+            SELECT 1 FROM segments s2
+            WHERE s2.sessionId = segments.sessionId
+              AND s2.id != segments.id
+              AND s2.startedAtMs >= segments.startedAtMs
+              AND (s2.startedAtMs - segments.endedAtMs) <= 5000
+              AND (s2.startedAtMs - segments.endedAtMs) >= -15000
+          )
+        """.trimIndent(),
+    )
+}
+
 @Database(
     entities = [SessionEntity::class, SegmentEntity::class, MeetingEntity::class],
-    version = 5,
+    version = 8,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {

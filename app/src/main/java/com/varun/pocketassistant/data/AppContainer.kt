@@ -26,7 +26,7 @@ class AppContainer(context: Context) {
         AppDatabase::class.java,
         "pocket_assistant.db",
     )
-        .addMigrations(MIGRATION_4_5)
+        .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
         .build()
 
     val audioStorage = AudioStorage(appContext)
