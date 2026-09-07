@@ -9,6 +9,7 @@ import com.varun.pocketassistant.capture.CaptureState
 import com.varun.pocketassistant.capture.CaptureStats
 import com.varun.pocketassistant.capture.RecordingHub
 import com.varun.pocketassistant.capture.RecordingService
+import com.varun.pocketassistant.capture.WeeklyCaptureSchedule
 import com.varun.pocketassistant.data.MeetingEntity
 import com.varun.pocketassistant.data.OverlapPreview
 import com.varun.pocketassistant.data.SegmentEntity
@@ -59,6 +60,11 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     val captureStats: StateFlow<CaptureStats> = RecordingHub.stats
+
+    /** Persisted weekly capture schedule + override (Room-backed). */
+    val captureSchedule: StateFlow<WeeklyCaptureSchedule> =
+        app.container.captureScheduleStore.observe()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), WeeklyCaptureSchedule())
 
     private val _playback = MutableStateFlow(PlaybackState())
     val playback: StateFlow<PlaybackState> = _playback.asStateFlow()
@@ -198,6 +204,13 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
 
     fun stopRecording() {
         RecordingService.stop(getApplication())
+    }
+
+    /** Manual "mic on outside schedule" override — the only manual on/off. */
+    fun setCaptureOverride(enabled: Boolean) {
+        viewModelScope.launch {
+            app.container.captureScheduleStore.setOverride(enabled)
+        }
     }
 
     fun deleteSession(sessionId: String) {
@@ -346,4 +359,5 @@ fun CaptureState.label(): String = when (this) {
     CaptureState.IDLE -> "Idle"
     CaptureState.RECORDING -> "Listening"
     CaptureState.PAUSED -> "Paused"
+    CaptureState.SCHEDULED_OFF -> "Schedule off"
 }

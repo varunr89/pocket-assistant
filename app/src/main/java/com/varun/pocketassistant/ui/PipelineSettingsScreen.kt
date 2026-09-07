@@ -159,7 +159,7 @@ fun PipelineSettingsScreen(onBack: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Pipeline") },
+                title = { Text("Settings") },
                 navigationIcon = {
                     TextButton(onClick = onBack) { Text("Back") }
                 },
@@ -174,6 +174,8 @@ fun PipelineSettingsScreen(onBack: () -> Unit) {
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            CaptureScheduleSettingsSection()
+
             Text(
                 "Cloud (OpenRouter): silence-trim only (no speedup), ~10 min capture rolls when " +
                     "cloud ASR is preferred, and long files are chunked at ~10 min. " +

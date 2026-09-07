@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Database
 import androidx.room.Entity
 import androidx.room.Insert
+import androidx.room.OnConflictStrategy
 import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.RoomDatabase
@@ -90,6 +91,16 @@ enum class MeetingStatus {
     READY,
     FAILED,
 }
+
+/**
+ * Minimal key-value settings row (DB v9). One string value per key; used for
+ * small persisted app settings such as the capture schedule.
+ */
+@Entity(tableName = "settings")
+data class SettingsEntity(
+    @PrimaryKey val key: String,
+    val value: String,
+)
 
 @Dao
 interface SessionDao {
@@ -232,6 +243,18 @@ interface MeetingDao {
     suspend fun delete(id: String)
 }
 
+@Dao
+interface SettingsDao {
+    @Query("SELECT value FROM settings WHERE `key` = :key")
+    suspend fun getValue(key: String): String?
+
+    @Query("SELECT value FROM settings WHERE `key` = :key")
+    fun observeValue(key: String): Flow<String?>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(entity: SettingsEntity)
+}
+
 val MIGRATION_4_5 = object : Migration(4, 5) {
     override fun migrate(db: SupportSQLiteDatabase) {
         db.execSQL("ALTER TABLE segments ADD COLUMN asrLastError TEXT")
@@ -280,6 +303,18 @@ val MIGRATION_7_8 = object : Migration(7, 8) {
     }
 }
 
+/** Additive only: the `settings` key-value table for the capture schedule. */
+val MIGRATION_8_9 = object : Migration(8, 9) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS `settings` (" +
+                "`key` TEXT NOT NULL, " +
+                "`value` TEXT NOT NULL, " +
+                "PRIMARY KEY(`key`))",
+        )
+    }
+}
+
 /**
  * Backfill `endReason = duration_cap` for segments that were cut short by the
  * max-duration cap (>= 105000 ms) and followed immediately by another segment
@@ -304,12 +339,18 @@ private fun backfillDurationCapEndReason(db: SupportSQLiteDatabase) {
 }
 
 @Database(
-    entities = [SessionEntity::class, SegmentEntity::class, MeetingEntity::class],
-    version = 8,
+    entities = [
+        SessionEntity::class,
+        SegmentEntity::class,
+        MeetingEntity::class,
+        SettingsEntity::class,
+    ],
+    version = 9,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun sessionDao(): SessionDao
     abstract fun segmentDao(): SegmentDao
     abstract fun meetingDao(): MeetingDao
+    abstract fun settingsDao(): SettingsDao
 }

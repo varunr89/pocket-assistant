@@ -30,6 +30,8 @@ enum class CaptureState {
     IDLE,
     RECORDING,
     PAUSED,
+    /** Service is alive but the capture schedule gate holds the mic OFF. */
+    SCHEDULED_OFF,
 }
 
 /**
@@ -42,6 +44,7 @@ class AudioCaptureEngine(
     private val scope: CoroutineScope,
     private val pipelineConfig: PipelineConfig? = null,
     private val vad: VoiceActivityDetector = TenVoiceActivityDetector.createOrFallback(),
+    private val gate: CaptureScheduleGate,
 ) {
     private val mutex = Mutex()
     private var captureJob: Job? = null
@@ -217,31 +220,71 @@ class AudioCaptureEngine(
         require(minBuf > 0) { "AudioRecord buffer unavailable ($minBuf)" }
 
         val bufferSize = maxOf(minBuf, SAMPLE_RATE / 5) // ~200ms
-        val recorder = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            bufferSize * 2,
-        )
-        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-            recorder.release()
-            error("AudioRecord failed to initialize")
-        }
-
-        audioRecord = recorder
-        recorder.startRecording()
-        pushEvent("Mic opened @ ${SAMPLE_RATE}Hz")
-
-        val readBuffer = ShortArray(bufferSize)
         while (scope.isActive && captureJob?.isActive == true) {
-            val read = recorder.read(readBuffer, 0, readBuffer.size)
-            if (read <= 0) continue
-            if (paused) continue
-
-            mutex.withLock {
-                processFrame(sessionId, readBuffer, read)
+            if (!gate.isOpenNow()) {
+                // Schedule gate closed: the mic is OFF and nothing is written.
+                // Release any open segment/writer from the previous window,
+                // then wait — without touching the mic — until the schedule (or
+                // the override toggle) opens the gate again.
+                releaseRecorder()
+                mutex.withLock { closeWriterIfNeeded(finalize = true) }
+                vad.reset()
+                preRoll.clear()
+                wasSpeech = false
+                phase = CapturePhase.SCHEDULED_OFF
+                pushEvent("Capture schedule closed — mic off")
+                publish(
+                    _stats.value.copy(
+                        state = CaptureState.SCHEDULED_OFF,
+                        phase = CapturePhase.SCHEDULED_OFF,
+                        speechActive = false,
+                        events = events.toList(),
+                    ),
+                )
+                if (!gate.awaitOpen()) return // service stopping — leave cleanly
+                pushEvent("Capture schedule open — mic on")
+                continue
             }
+
+            // Gate open: (re)open the mic for this window. Reconstructed on
+            // every window entry; releaseRecorder() above guarantees only one
+            // recorder exists at a time.
+            val recorder = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize * 2,
+            )
+            if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+                recorder.release()
+                error("AudioRecord failed to initialize")
+            }
+
+            audioRecord = recorder
+            recorder.startRecording()
+            pushEvent("Mic opened @ ${SAMPLE_RATE}Hz")
+            phase = CapturePhase.LISTENING
+            publish(
+                _stats.value.copy(
+                    state = if (paused) CaptureState.PAUSED else CaptureState.RECORDING,
+                    phase = CapturePhase.LISTENING,
+                    speechActive = false,
+                    events = events.toList(),
+                ),
+            )
+
+            val readBuffer = ShortArray(bufferSize)
+            while (scope.isActive && captureJob?.isActive == true && gate.isOpenNow()) {
+                val read = recorder.read(readBuffer, 0, readBuffer.size)
+                if (read <= 0) continue
+                if (paused) continue
+
+                mutex.withLock {
+                    processFrame(sessionId, readBuffer, read)
+                }
+            }
+            releaseRecorder()
         }
     }
 

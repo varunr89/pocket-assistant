@@ -55,8 +55,9 @@ Basis: `AGENTS.md`, `docs/product-vision.md`, `docs/engineering/architecture-fin
 - Device↔Room reconciliation audit: completed segments are never re-transcribed.
 - E2E gate: kill the app mid-meeting-transcription → reopen → in-flight meeting resumes from the first unfinished segment; completed segments are never re-transcribed.
 
-### 6. Schedule-gated capture
-- Weekly user-editable capture window (default weekdays 08:00–17:00); outside it the mic is off — nothing captured (battery + privacy). "Mic on outside schedule" manual override toggle (Today screen + Settings) for one-offs; toggling it is the only start/stop interaction — the schedule replaces tap-to-start.
+### 6. Schedule-gated capture — DONE (this commit)
+Landed as the "3a" half of the meeting-layer decomposition: weekly schedule + override + settings persistence + engine gate ONLY. The meetings model/queue half ("3b") remains in increments 3-5.
+- Weekly user-editable capture window (default weekdays 08:00-17:00); outside it the mic is off — nothing captured (battery + privacy). "Mic on outside schedule" manual override toggle (Today screen + Settings) for one-offs; toggling it is the only start/stop interaction — the schedule replaces tap-to-start.
 - Capture stack inside the window is unchanged: passive mic → VAD → 16k mono segments → on-device raw audio, 30-day Opus48k rolling window. Settings capture-schedule editor is the one net-new settings surface.
 - E2E gate: with default schedule, zero segments/raw-audio bytes are written outside weekdays 08:00–17:00 unless override is on.
 

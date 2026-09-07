@@ -1,10 +1,14 @@
 package com.varun.pocketassistant
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.core.content.ContextCompat
+import com.varun.pocketassistant.capture.RecordingService
 import com.varun.pocketassistant.pipeline.PipelineConfig
 import com.varun.pocketassistant.pipeline.PipelineSettings
 import com.varun.pocketassistant.pipeline.ProviderMode
@@ -17,6 +21,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         applyDebugPipelineExtras()
+        startCaptureServiceIfAppropriate()
         enableEdgeToEdge()
         setContent {
             PocketAssistantTheme {
@@ -29,6 +34,20 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         applyDebugPipelineExtras()
+    }
+
+    /**
+     * The capture schedule owns the mic: the service runs continuously and the
+     * schedule gate decides when the mic is open. Starting it here (once the
+     * microphone permission exists) makes the schedule authoritative without a
+     * manual tap; before the permission is granted the first-run flow already
+     * starts capturing from the permission callback.
+     */
+    private fun startCaptureServiceIfAppropriate() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) return
+        RecordingService.start(this)
     }
 
     /** Debug-only: adb am start … --es pipeline_api_key … to configure OpenRouter without UI. */

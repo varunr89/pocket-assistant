@@ -53,6 +53,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -86,6 +87,7 @@ import com.varun.pocketassistant.capture.AudioCaptureEngine
 import com.varun.pocketassistant.capture.CapturePhase
 import com.varun.pocketassistant.capture.CaptureStats
 import com.varun.pocketassistant.capture.CaptureState
+import com.varun.pocketassistant.capture.WeeklyCaptureSchedule
 import com.varun.pocketassistant.data.MeetingEntity
 import com.varun.pocketassistant.data.MeetingStatus
 import com.varun.pocketassistant.data.SegmentEntity
@@ -154,6 +156,7 @@ fun HomeScreen(
     val playback by viewModel.playback.collectAsState()
     val stats by viewModel.captureStats.collectAsState()
     val browseMode by viewModel.browseMode.collectAsState()
+    val captureSchedule by viewModel.captureSchedule.collectAsState()
     val dayStartMs by viewModel.dayStartMs.collectAsState()
     val daySegments by viewModel.daySegments.collectAsState()
     val dayMeetings by viewModel.dayMeetings.collectAsState()
@@ -202,7 +205,7 @@ fun HomeScreen(
             TopAppBar(
                 title = { Text("Pocket Assistant") },
                 actions = {
-                    TextButton(onClick = onPipeline) { Text("Pipeline") }
+                    TextButton(onClick = onPipeline) { Text("Settings") }
                     TextButton(onClick = onTrainVoice) { Text("Train voice") }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -245,6 +248,14 @@ fun HomeScreen(
                     onResume = viewModel::resumeRecording,
                     onStop = viewModel::stopRecording,
                 )
+
+                if (stats.state == CaptureState.SCHEDULED_OFF) {
+                    Spacer(Modifier.height(12.dp))
+                    ScheduleOverrideCard(
+                        schedule = captureSchedule,
+                        onToggle = viewModel::setCaptureOverride,
+                    )
+                }
 
                 Spacer(Modifier.height(16.dp))
                 ObservabilityPanel(stats = stats)
@@ -1022,6 +1033,7 @@ private fun CaptureHero(
             CapturePhase.POST_ROLL -> MaterialTheme.colorScheme.tertiary
             CapturePhase.LISTENING -> MaterialTheme.colorScheme.primary
             CapturePhase.PAUSED -> MaterialTheme.colorScheme.tertiary
+            CapturePhase.SCHEDULED_OFF -> MaterialTheme.colorScheme.surfaceVariant
             CapturePhase.IDLE -> MaterialTheme.colorScheme.surfaceVariant
         },
         label = "orb",
@@ -1131,8 +1143,41 @@ private fun CaptureHero(
                         Text("Stop")
                     }
                 }
+                CaptureState.SCHEDULED_OFF -> {
+                    // The capture schedule owns the mic here; the override
+                    // switch below the hero is the single manual control.
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun ScheduleOverrideCard(
+    schedule: WeeklyCaptureSchedule,
+    onToggle: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surface)
+            .padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+            Text("Mic on outside schedule", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Capture is off — outside your window (${schedule.summary()}).",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(
+            checked = schedule.overrideEnabled,
+            onCheckedChange = onToggle,
+        )
     }
 }
 
@@ -1272,6 +1317,8 @@ private fun parseMeetingMeta(json: String?): MeetingMeta {
 
 private fun phaseMessage(stats: CaptureStats): String = when (stats.phase) {
     CapturePhase.IDLE -> "Ready to listen around you."
+    CapturePhase.SCHEDULED_OFF ->
+        "Mic is off — outside your capture schedule. Turn on \"Mic on outside schedule\" to capture now."
     CapturePhase.LISTENING ->
         if (stats.openGateProgressMs > 0) {
             "Hearing speech… TEN VAD gate ${stats.openGateProgressMs}ms / ${stats.openGateRequiredMs}ms."

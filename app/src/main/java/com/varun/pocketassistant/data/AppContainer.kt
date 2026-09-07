@@ -3,6 +3,7 @@ package com.varun.pocketassistant.data
 import android.content.Context
 import androidx.room.Room
 import com.varun.pocketassistant.capture.AudioStorage
+import com.varun.pocketassistant.capture.CaptureScheduleStore
 import com.varun.pocketassistant.capture.RetentionPolicy
 import com.varun.pocketassistant.pipeline.CloudAsrProvider
 import com.varun.pocketassistant.pipeline.CloudCircuitBreaker
@@ -34,13 +35,16 @@ class AppContainer(context: Context) {
         AppDatabase::class.java,
         "pocket_assistant.db",
     )
-        .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)
+        .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)
         .build()
 
     val audioStorage = AudioStorage(appContext)
     val retentionPolicy = RetentionPolicy(daysToKeep = 14)
     val pipelineConfig = PipelineConfig(appContext)
     val speakerStore = SpeakerProfileStore(appContext)
+
+    /** Persisted weekly capture schedule + override (Room `settings` KV row). */
+    val captureScheduleStore = CaptureScheduleStore(database.settingsDao())
 
     val cloudCircuitBreaker = CloudCircuitBreaker()
     val openAiClient = OpenAiCompatibleClient(pipelineConfig, cloudCircuitBreaker)

@@ -10,6 +10,8 @@ enum class CapturePhase {
     LIVE_SPEECH,
     POST_ROLL,
     PAUSED,
+    /** Capture schedule gate is closed: mic released, nothing written. */
+    SCHEDULED_OFF,
 }
 
 data class CaptureEvent(

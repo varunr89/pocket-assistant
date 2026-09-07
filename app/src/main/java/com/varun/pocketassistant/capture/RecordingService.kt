@@ -43,6 +43,10 @@ class RecordingService : Service() {
             audioStorage = app.container.audioStorage,
             scope = ioScope,
             pipelineConfig = app.container.pipelineConfig,
+            gate = CaptureScheduleGate(
+                scheduleFlow = app.container.captureScheduleStore.observe(),
+                scope = serviceScope,
+            ),
         )
         RecordingHub.bind(engine)
 
@@ -112,11 +116,15 @@ class RecordingService : Service() {
             CapturePhase.POST_ROLL -> "Post-roll (${stats.hangoverRemainingMs / 1000}s left)"
             CapturePhase.LISTENING -> "Listening — buffering ${stats.preRollBufferedMs / 1000}s"
             CapturePhase.PAUSED -> getString(R.string.notification_paused)
+            CapturePhase.SCHEDULED_OFF -> "Mic off — outside schedule"
             CapturePhase.IDLE -> getString(R.string.app_name)
         }
 
         val openMb = AudioCaptureEngine.formatBytes(stats.currentSegmentBytes)
-        val text = if (stats.speechProbability >= 0f) {
+        val text = if (stats.phase == CapturePhase.SCHEDULED_OFF) {
+            "Outside your capture schedule — nothing is captured. Turn on " +
+                "\"Mic on outside schedule\" to capture now."
+        } else if (stats.speechProbability >= 0f) {
             "VAD p=%.2f · seg %d · open %s · %s".format(
                 stats.speechProbability,
                 stats.segmentCount,
@@ -138,7 +146,9 @@ class RecordingService : Service() {
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
 
-        if (stats.state == CaptureState.RECORDING) {
+        if (stats.phase == CapturePhase.SCHEDULED_OFF) {
+            // The schedule owns the mic while gated; no pause/resume here.
+        } else if (stats.state == CaptureState.RECORDING) {
             builder.addAction(0, "Pause", servicePendingIntent(ACTION_PAUSE, 1))
         } else if (stats.state == CaptureState.PAUSED) {
             builder.addAction(0, "Resume", servicePendingIntent(ACTION_RESUME, 2))

@@ -100,5 +100,6 @@ fun phaseColor(phase: CapturePhase): Color = when (phase) {
     CapturePhase.LIVE_SPEECH -> Color(0xFF1F6F70)
     CapturePhase.POST_ROLL -> Color(0xFFB85C38)
     CapturePhase.PAUSED -> Color(0xFFB85C38)
+    CapturePhase.SCHEDULED_OFF -> Color(0xFFD0D8D4)
     CapturePhase.IDLE -> Color(0xFFD0D8D4)
 }
