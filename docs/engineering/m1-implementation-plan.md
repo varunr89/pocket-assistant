@@ -6,7 +6,7 @@ Basis: `AGENTS.md`, `docs/product-vision.md`, `docs/engineering/architecture-fin
 ## Product decision (product intent, not to be relitigated here)
 - Capture is now SCHEDULE-GATED (default weekdays 08:00–17:00, user-editable, manual override toggle) but the capture STACK is unchanged: mic → VAD → 16k mono segments → raw audio kept on-device, 30-day Opus48k rolling window.
 - Transcription moves to the FOREGROUND using Google's official on-device ASR: the ML Kit GenAI Speech Recognition API, Advanced Mode (Gemini Nano via AICore), natively supported on Pixel 10 and Pixel 11 series.
-- Catch-up transcription must be fast so the user doesn't wait long; the user picked option A = foreground-only official transcription, accepting that segments transcribe when the app is next opened/foreground. SLO 6 becomes a measured foreground catch-up rate (see `architecture-final.md` §5).
+- Catch-up transcription must be fast so the user doesn't wait long; the user picked option A = foreground-only official transcription, accepting that segments transcribe live while the app is open (foreground). SLO 6 becomes a measured foreground catch-up rate (see `architecture-final.md` §5).
 
 ## What changes vs the old plan
 - The old leading candidate (sherpa-onnx CPU int8) is demoted to parked plan-B together with Parakeet/LiteRT. Parked harness files are NOT deleted — see "Parked" below.
@@ -29,7 +29,7 @@ Basis: `AGENTS.md`, `docs/product-vision.md`, `docs/engineering/architecture-fin
 ## Ordered increments (small; each = files, green `./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug`, commit + push main, report)
 
 ### 1. Docs re-scope — DONE (this commit)
-`architecture-final.md` ASR/SLO-6 rewrite + this plan. No code.
+`architecture-final.md` ASR/SLO-6 rewrite + schedule-gated capture + meeting-layer amendment + this plan. No code.
 
 ### 2. Foundation: foreground-gated ML Kit GenAI ASR + catch-up drain — DONE (39bf262)
 - NEW `speech/MLKitGenAiAsrEngine.kt`: thin wrapper over the verified surface above. WAV header validation (16k mono PCM16 required — mismatch is a visible failure, never fed to AICore), pipe-based real-time-paced feeding, FinalTextResponse accumulation until CompletedResponse, typed failure classification, model `checkStatus()` + on-demand `download()`.
@@ -39,9 +39,10 @@ Basis: `AGENTS.md`, `docs/product-vision.md`, `docs/engineering/architecture-fin
 - Do not delete or rewire sherpa increment-4 harness files; mark them parked in docs only (done here).
 
 ### 3. Meeting model + queue (Room) — the unit of attention
-- NEW Room `meetings` table (id, started_at, priority, status, manual flag, descriptor cache). Segments roll into a meeting via the existing VAD on/off rolloff (a meeting starts when VAD first triggers with no active meeting; a segment begins a new segment on rolloff). Segments are NEVER shown as status units — the meeting is the unit.
+- EXTEND the existing Room `meetings` table — do NOT create a new one. It already exists in code (`AppDatabase.kt:59`, DB version 8: id, title, startedAtMs, endedAtMs, status, cleanedTranscript, metadataJson, cleanupProvider, cleanTextOnly, lastError, updatedAtMs, createdAtMs) and `segments.meetingId` (nullable FK) already links segments to it. Add `priority`, `manual_start_marker` and a descriptor cache. The existing `status` column is the CLEANUP-pipeline axis (MeetingStatus: PENDING_CLEANUP/CLEANING/READY/FAILED, driven by MeetingStage/MeetingStageWorker); the queue needs a transcription-axis status (waiting/transcribing/done). Introduce the transcription axis ALONGSIDE the cleanup axis and write the explicit reconciliation with MeetingStage (one table, two axes, no transition collisions) in the engineering architecture BEFORE any code. Segments roll into a meeting via the existing VAD on/off rolloff (a meeting starts when VAD first triggers with no active meeting; a segment begins a new segment on rolloff). Segments are NEVER shown as status units — the meeting is the unit.
 - Queue order = persisted per-meeting `priority` + `started_at`; new meetings insert oldest-first; manual drag = explicit priority for existing rows. Today screen = reorderable list of today's meetings with per-meeting status chip (waiting / transcribing / done) and a time-range title ("Meet 09:30–10:30", 10-min granularity) as the default label.
 - Drain re-route: `TranscriptionDrainService` selection now walks the queue (priority-sorted meetings → their segments oldest-first) instead of raw PENDING segments; claim/persist/typed-error logic unchanged. This is the live-while-open path — while foreground, capture feeds the queue near-real-time.
+- Sync rider (spec line 29): meeting metadata mirrors into the Neon `sessions` row — no Neon schema change, metadata rides on `sessions`; the on-device `meetings` table itself never syncs.
 - E2E gate: a scripted 3-meeting morning yields exactly 3 meeting rows with start times; drag-reordering a waiting meeting above the transcribing one changes *next* selection only.
 
 ### 4. Cancel → graceful wind-down + slot #2

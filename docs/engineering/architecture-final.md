@@ -1,6 +1,6 @@
 # Pocket Assistant — Final Locked Architecture
 
-**Status: LOCKED.** Consolidated reference for the M1 feature spec. Supersedes `architecture.md` and `hosting-options*.md` wherever they conflict; absorbs `product-vision.md`, `roadmap.md`, and `research/*`. Do not relitigate anything here except §7. Amended 2026-09-06 by product decision: ASR provider (§1) and SLO 6 time-to-value (§5) — see `m1-implementation-plan.md` for the re-scoped plan.
+**Status: LOCKED.** Consolidated reference for the M1 feature spec. Supersedes `architecture.md` and `hosting-options*.md` wherever they conflict; absorbs `product-vision.md`, `roadmap.md`, and `research/*`. Do not relitigate anything here except §7. Amended 2026-09-06 by product decision: ASR provider (§1) and SLO 6 time-to-value (§5) — see `m1-implementation-plan.md` for the re-scoped plan. Amended 2026-09-07 by the meeting-layer spec (75f596b): capture becomes schedule-gated and a meeting queue/UX layer is added on top of the drain (increments 3–7).
 
 ## 1. System shape — one private pipeline per user, three layers
 
@@ -34,7 +34,7 @@ segments(id, session_id, start_ms, end_ms,      ASR raw output + confidence (v1)
 keywords(segment_id, keyword, entity_type)
 ```
 
-Enrichment is a pipeline stage that CLEANS transcripts AND extracts keywords/entities ("Wallei"→"Walley", "Contena"→"Container") per segment. FTS indexes `clean_text + keywords` — search never touches raw ASR output. Phone SQLite holds the same tables + audio; the Neon schema mirrors it one-to-one (portability by construction).
+Enrichment is a pipeline stage that CLEANS transcripts AND extracts keywords/entities ("Wallei"→"Walley", "Contena"→"Container") per segment. FTS indexes `clean_text + keywords` — search never touches raw ASR output. Phone SQLite holds the same tables + audio; the Neon schema mirrors it one-to-one (portability by construction). On-device only: the Room `meetings` table (DB v8) is the foreground queue/UX unit (priority, manual boundary marker, descriptor cache) and never a sync table — meeting metadata is mirrored into the Neon `sessions` row instead (no Neon schema change).
 
 ## 3. Retrieval — LLM-as-retriever over time windows (the core pattern)
 
@@ -55,7 +55,7 @@ Enrichment is a pipeline stage that CLEANS transcripts AND extracts keywords/ent
 | Capture integrity | zero silent loss — device↔store reconciliation after crash/reboot/offline |
 | Battery | 1–3%/hr VAD-gated capture on target Pixel (measured, not assumed) |
 | Failure visibility | no silent failures — every segment/session reaches a visible terminal state |
-| Time-to-value (SLO 6) | foreground catch-up: the background capture backlog is transcribed when the app is next in foreground; the contract is a measured foreground catch-up rate (audio-minutes drained per foreground-minute), baselined on device — NOT a background 15–60 min eventual window |
+| Time-to-value (SLO 6) | foreground catch-up: the background capture backlog drains live while the app is in the foreground; the contract is a measured foreground catch-up rate (audio-minutes drained per foreground-minute), baselined on device — NOT a background 15–60 min eventual window |
 | Cost | ≤$7/mo hosted @ 6 users; hard caps + metering; no central AI-billing surface |
 
 **Pricing-tier mapping (product thesis, locked):**
@@ -91,6 +91,6 @@ Enrichment is a pipeline stage that CLEANS transcripts AND extracts keywords/ent
 
 ### RESOLVED (2026-09-07)
 1. **Enrichment placement → Hybrid (on-device default, hosted optional).** Build the hosted path now as a fallback, keep on-device default, positioned to drop cloud dependency as local models improve.
-2. **Raw-audio window + codec → 30-day Opus 48k (on-device only).** Kept for re-transcription; ~3.5 GB steady-state; speech-grade lossy adequate for ASR re-runs and verification.
+2. **Raw-audio window + codec → 30-day Opus48k (on-device only).** Kept for re-transcription; ~3.5 GB steady-state; speech-grade lossy adequate for ASR re-runs and verification.
 3. **Neon free-tier graduation → Deferred.** Revisit when the circle grows; a manual/export path suffices now.
 4. **Primary on-device ASR → ML Kit GenAI Speech Recognition, Advanced mode, foreground-gated (2026-09-06).** Capture is schedule-gated (default weekdays 08:00–17:00, user-editable, manual override) but the capture stack is unchanged (passive mic → VAD → 16k mono segments → on-device raw audio, 30-day Opus48k rolling window); transcription drains live-while-open in the foreground (option A). Parakeet/LiteRT + sherpa-CPU demoted to parked plan-B; their code/harness stay in the tree, marked parked, not deleted.
