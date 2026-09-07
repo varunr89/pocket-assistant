@@ -11,12 +11,20 @@ import com.varun.pocketassistant.pipeline.GemmaCleanupProvider
 import com.varun.pocketassistant.pipeline.OpenAiCompatibleClient
 import com.varun.pocketassistant.pipeline.ParakeetAsrProvider
 import com.varun.pocketassistant.pipeline.PipelineConfig
+import com.varun.pocketassistant.pipeline.ProviderMode
 import com.varun.pocketassistant.pipeline.ProviderRouter
 import com.varun.pocketassistant.pipeline.work.PipelineScheduler
+import com.varun.pocketassistant.speech.AppForegroundTracker
 import com.varun.pocketassistant.speech.AsrStage
+import com.varun.pocketassistant.speech.MLKitGenAiAsrEngine
 import com.varun.pocketassistant.speech.MeetingStage
+import com.varun.pocketassistant.speech.RepositoryCatchUpQueue
 import com.varun.pocketassistant.speech.SpeakerProfileStore
+import com.varun.pocketassistant.speech.TranscriptionDrain
+import com.varun.pocketassistant.speech.TranscriptionDrainHub
+import com.varun.pocketassistant.speech.TranscriptionDrainService
 import java.io.File
+import java.util.Locale
 
 class AppContainer(context: Context) {
     private val appContext = context.applicationContext
@@ -56,6 +64,38 @@ class AppContainer(context: Context) {
     val meetingRepository = MeetingRepository(
         meetingDao = database.meetingDao(),
         segmentDao = database.segmentDao(),
+    )
+
+    /**
+     * Foreground-gated catch-up transcription (M1 2026-09-06 option A).
+     * The drain owns local/freemium ASR segments ONLY while the app is the
+     * top foreground app; the tracker starts/stops the service on foreground
+     * transitions. Cloud wiring (`cloud_stt`, paid tier) is untouched.
+     */
+    private val foregroundGate = AppForegroundTracker(appContext) { nowForeground ->
+        if (nowForeground) {
+            TranscriptionDrainService.start(appContext)
+        } else {
+            TranscriptionDrainService.stop(appContext)
+        }
+    }
+
+    val catchUpQueue = RepositoryCatchUpQueue(sessionRepository)
+
+    val transcriptionDrain = TranscriptionDrain(
+        engine = MLKitGenAiAsrEngine(),
+        queue = catchUpQueue,
+        gate = foregroundGate,
+        // Local mode owns transcription (freemium); cloud mode keeps the
+        // legacy background worker until the routing increment re-wires it.
+        enabled = { pipelineConfig.load().asrMode == ProviderMode.PREFER_LOCAL },
+        localeTag = {
+            val tag = pipelineConfig.load().sttLanguage
+            if (tag.isBlank()) "en-US" else {
+                runCatching { Locale.forLanguageTag(tag).toLanguageTag() }.getOrDefault("en-US")
+            }
+        },
+        diagnosticsListener = { TranscriptionDrainHub.publish(it) },
     )
 
     val asrStage = AsrStage(

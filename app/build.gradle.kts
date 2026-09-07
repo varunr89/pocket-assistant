@@ -44,6 +44,12 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    testOptions {
+        // JVM unit tests exercise pipeline logic whose error paths log via
+        // android.util.Log; return defaults for android.jar stubs.
+        unitTests.isReturnDefaultValues = true
+    }
+
     kotlinOptions {
         jvmTarget = "17"
     }
@@ -110,6 +116,12 @@ dependencies {
 
     // LiteRT-LM Gemma cleanup.
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.14.0")
+
+    // ML Kit GenAI Speech Recognition (Advanced mode, Gemini Nano via AICore).
+    // ALPHA — pinned exactly; re-verify API surface on any bump (surface
+    // verified against the shipped 1.0.0-alpha1 AAR on 2026-09-06).
+    // ML Kit ToS: https://developers.google.com/ml-kit/terms
+    implementation("com.google.mlkit:genai-speech-recognition:1.0.0-alpha1")
 
     // Test scaffolding (M1 increment 1): JVM unit tests + instrumented tests.
     testImplementation("junit:junit:4.13.2")

@@ -58,6 +58,13 @@
             android:exported="false"
             android:foregroundServiceType="microphone" />
 
+        <!-- Foreground-gated ML Kit GenAI catch-up transcription. Regular
+             (non-foreground-type) service: it only ever runs while the app is
+             the top foreground app, so no FGS type is needed. -->
+        <service
+            android:name=".speech.TranscriptionDrainService"
+            android:exported="false" />
+
         <!-- WorkManager FGS: must declare dataSync for setForeground() on API 34+. -->
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
