@@ -78,3 +78,8 @@ Enrichment is a pipeline stage that CLEANS transcripts AND extracts keywords/ent
 1. **Enrichment placement:** on-device pass vs Worker-hosted — cost/privacy/latency of the enrich step (either way data stays within the user's own instance).
 2. **Raw-audio window + codec (on-device only now):** 14/30/90 days; WAV (~18 GB @30d) vs Opus (~1.7 GB @30d) — storage vs transcript-verification tradeoff.
 3. **Neon free-tier graduation:** when a busy user exceeds the free limit, who triggers/what policy promotes them to Launch (~$15/mo) — policy, not technology.
+
+### RESOLVED (2026-09-07)
+1. **Enrichment placement → Hybrid (on-device default, hosted optional).** Build the hosted path now as a fallback, keep on-device default, positioned to drop cloud dependency as local models improve.
+2. **Raw-audio window + codec → 30-day Opus 48k (on-device only).** Kept for re-transcription; ~3.5 GB steady-state; speech-grade lossy adequate for ASR re-runs and verification.
+3. **Neon free-tier graduation → Deferred.** Revisit when the circle grows; a manual/export path suffices now.
