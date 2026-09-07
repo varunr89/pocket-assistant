@@ -120,4 +120,11 @@ dependencies {
     androidTestImplementation("androidx.test:rules:1.6.1")
     androidTestImplementation("androidx.test:core-ktx:1.6.1")
     androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.1")
+
+    // M1 increment 4: benchmark-only sherpa-onnx runtime (NOT a production
+    // dependency; the sherpa adapter lives in androidTest only). Pinned:
+    // v1.12.27, sha256 ef0466b4e66fa950e7f5a395e69dbe1a54c9f6425c73c724474e195e2b676e3c,
+    // Apache-2.0. Source:
+    // https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.27/sherpa-onnx-1.12.27.aar
+    androidTestImplementation(files("libs/sherpa-onnx-1.12.27.aar"))
 }

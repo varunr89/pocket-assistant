@@ -34,12 +34,25 @@ import kotlin.time.Duration.Companion.seconds
  * - Single-flight + single-thread native access (NativeEngineGate); abort the
  *   whole file on a mid-file NPU invoke flake instead of reload-and-continue
  *   (reloading a shared in-use CompiledModel is the SIGSEGV source)
+ * - Explicit accelerator selection (ParakeetAccelerator.NPU default; CPU uses
+ *   the pinned i8 export, gated only on CPU weights + tokenizer — no NPU checks)
  */
+
+/** Which LiteRT accelerator the engine compiles the Parakeet model for. */
+enum class ParakeetAccelerator { NPU, CPU }
+
 object ParakeetLocalModels {
     const val REL_DIR = "models/parakeet"
     const val CPU_MODEL = "model.tflite"
     const val NPU_MODEL = "model_npu.tflite"
     const val TOKENIZER = "tokenizer.json"
+
+    /**
+     * The pinned CPU export (parakeet_tdt_0.6b_v3_5s_i8_stateful.tflite,
+     * staged as model.tflite) is ~614 MB. Require a real weight file, not a
+     * placeholder — a CPU_MODEL constant is not a working fallback.
+     */
+    private const val CPU_MODEL_MIN_BYTES = 500_000_000L
 
     fun dir(context: Context): File = File(context.filesDir, REL_DIR)
 
@@ -47,16 +60,25 @@ object ParakeetLocalModels {
 
     fun npuModel(context: Context): File = File(dir(context), NPU_MODEL)
 
+    fun cpuModel(context: Context): File = File(dir(context), CPU_MODEL)
+
     fun hasTokenizer(context: Context): Boolean =
         tokenizerFile(context).exists() && tokenizerFile(context).length() > 1_000L
 
     fun hasNpuModel(context: Context): Boolean =
         npuModel(context).exists() && npuModel(context).length() > 1_000_000L
 
+    fun hasCpuModel(context: Context): Boolean =
+        cpuModel(context).exists() && cpuModel(context).length() >= CPU_MODEL_MIN_BYTES
+
     fun isAvailable(context: Context): Boolean =
         hasTokenizer(context) &&
             hasNpuModel(context) &&
             NpuCompatibilityChecker.GoogleTensor.isDeviceSupported()
+
+    /** CPU availability depends only on tokenizer + CPU weights — no NPU checks. */
+    fun isCpuAvailable(context: Context): Boolean =
+        hasTokenizer(context) && hasCpuModel(context)
 
     fun modelConfig(context: Context): ModelConfig {
         return ModelConfig(
@@ -95,56 +117,95 @@ class ParakeetAsrEngine(private val context: Context) : AutoCloseable {
     private var recognizer: LiteRtRunner? = null
     private var tokenizer: HuggingfaceTokenizer? = null
     private var preprocessor: MelSpectroProcessor? = null
+    private var loadedAccelerator: ParakeetAccelerator? = null
     private var modelInputInterval = 5.seconds
 
     val providerLabel: String = "parakeet_tdt_npu"
 
-    private fun ensureLoaded() {
-        if (recognizer != null) return
-        require(ParakeetLocalModels.isAvailable(appContext)) {
-            "Parakeet Tensor G5 NPU pack missing or device unsupported " +
-                "(soc=${Build.SOC_MODEL}, npuModel=${ParakeetLocalModels.hasNpuModel(appContext)}, " +
-                "tokenizer=${ParakeetLocalModels.hasTokenizer(appContext)}, " +
-                "googleTensor=${NpuCompatibilityChecker.GoogleTensor.isDeviceSupported()})"
+    private fun ensureLoaded(accelerator: ParakeetAccelerator) {
+        if (recognizer != null && loadedAccelerator == accelerator) return
+        if (recognizer != null) {
+            // Accelerator switch: dispose the old handle first. We hold the gate,
+            // so nothing else is invoking it — never close an in-use handle.
+            Log.i(TAG, "Switching Parakeet accelerator $loadedAccelerator -> $accelerator")
+            closeBlocking()
         }
-
-        val npuPath = ParakeetLocalModels.npuModel(appContext).absolutePath
-        val nativeLibDir = appContext.applicationInfo.nativeLibraryDir
-        val provider = BuiltinNpuAcceleratorProvider(appContext)
-        Log.i(
-            TAG,
-            "NPU load: soc=${Build.SOC_MODEL} model=$npuPath " +
-                "size=${File(npuPath).length()} nativeLibDir=$nativeLibDir " +
-                "providerReady=${provider.isLibraryReady()} " +
-                "deviceSupported=${provider.isDeviceSupported()} " +
-                "dispatchSo=${File(nativeLibDir, "libLiteRtDispatch_GoogleTensor.so").exists()}",
-        )
-
-        runCatching {
-            Os.setenv("ADSP_LIBRARY_PATH", nativeLibDir, true)
-            Os.setenv("LD_LIBRARY_PATH", nativeLibDir, true)
-        }.onFailure { Log.w(TAG, "setenv native lib path failed", it) }
-        runCatching {
-            System.loadLibrary("LiteRtDispatch_GoogleTensor")
-            Log.i(TAG, "Loaded libLiteRtDispatch_GoogleTensor")
-        }.onFailure { Log.w(TAG, "Explicit load of LiteRtDispatch_GoogleTensor failed: ${it.message}") }
 
         val config = ParakeetLocalModels.modelConfig(appContext)
         tokenizer = HuggingfaceTokenizer(appContext, config)
         preprocessor = MelSpectroProcessor(SAMPLING_RATE, config.logMelSpectro!!)
         modelInputInterval = config.inputMilliseconds.milliseconds
 
-        try {
-            recognizer = LiteRtRunner(
-                appContext,
-                config,
-                Accelerator.NPU,
-                npuOnly = true,
-            ) { model, cfg -> TdtDecoder(model, cfg) }
-            Log.i(TAG, "CompiledModel created on NPU (litert-samples path, npuOnly)")
-        } catch (t: Throwable) {
-            throw enrich("create CompiledModel(NPU)", t)
+        when (accelerator) {
+            ParakeetAccelerator.NPU -> {
+                require(ParakeetLocalModels.isAvailable(appContext)) {
+                    "Parakeet Tensor G5 NPU pack missing or device unsupported " +
+                        "(soc=${Build.SOC_MODEL}, npuModel=${ParakeetLocalModels.hasNpuModel(appContext)}, " +
+                        "tokenizer=${ParakeetLocalModels.hasTokenizer(appContext)}, " +
+                        "googleTensor=${NpuCompatibilityChecker.GoogleTensor.isDeviceSupported()})"
+                }
+
+                val npuPath = ParakeetLocalModels.npuModel(appContext).absolutePath
+                val nativeLibDir = appContext.applicationInfo.nativeLibraryDir
+                val provider = BuiltinNpuAcceleratorProvider(appContext)
+                Log.i(
+                    TAG,
+                    "NPU load: soc=${Build.SOC_MODEL} model=$npuPath " +
+                        "size=${File(npuPath).length()} nativeLibDir=$nativeLibDir " +
+                        "providerReady=${provider.isLibraryReady()} " +
+                        "deviceSupported=${provider.isDeviceSupported()} " +
+                        "dispatchSo=${File(nativeLibDir, "libLiteRtDispatch_GoogleTensor.so").exists()}",
+                )
+
+                runCatching {
+                    Os.setenv("ADSP_LIBRARY_PATH", nativeLibDir, true)
+                    Os.setenv("LD_LIBRARY_PATH", nativeLibDir, true)
+                }.onFailure { Log.w(TAG, "setenv native lib path failed", it) }
+                runCatching {
+                    System.loadLibrary("LiteRtDispatch_GoogleTensor")
+                    Log.i(TAG, "Loaded libLiteRtDispatch_GoogleTensor")
+                }.onFailure { Log.w(TAG, "Explicit load of LiteRtDispatch_GoogleTensor failed: ${it.message}") }
+
+                try {
+                    recognizer = LiteRtRunner(
+                        appContext,
+                        config,
+                        Accelerator.NPU,
+                        npuOnly = true,
+                    ) { model, cfg -> TdtDecoder(model, cfg) }
+                    Log.i(TAG, "CompiledModel created on NPU (litert-samples path, npuOnly)")
+                } catch (t: Throwable) {
+                    throw enrich(accelerator, "create CompiledModel(NPU)", t)
+                }
+            }
+
+            ParakeetAccelerator.CPU -> {
+                require(ParakeetLocalModels.isCpuAvailable(appContext)) {
+                    "Parakeet CPU (i8) pack missing " +
+                        "(cpuModel=${ParakeetLocalModels.hasCpuModel(appContext)}, " +
+                        "cpuBytes=${ParakeetLocalModels.cpuModel(appContext).length()}, " +
+                        "tokenizer=${ParakeetLocalModels.hasTokenizer(appContext)})"
+                }
+                val cpuPath = ParakeetLocalModels.cpuModel(appContext).absolutePath
+                Log.i(
+                    TAG,
+                    "CPU load: model=$cpuPath size=${File(cpuPath).length()} " +
+                        "soc=${Build.SOC_MODEL}",
+                )
+                try {
+                    recognizer = LiteRtRunner(
+                        appContext,
+                        config,
+                        Accelerator.CPU,
+                        npuOnly = false,
+                    ) { model, cfg -> TdtDecoder(model, cfg) }
+                    Log.i(TAG, "CompiledModel created on CPU (i8 export, no NPU dispatch)")
+                } catch (t: Throwable) {
+                    throw enrich(accelerator, "create CompiledModel(CPU)", t)
+                }
+            }
         }
+        loadedAccelerator = accelerator
     }
 
     /**
@@ -154,11 +215,18 @@ class ParakeetAsrEngine(private val context: Context) : AutoCloseable {
      * Single-flight and pinned to the engine's serial dispatcher: concurrent
      * callers queue instead of sharing the CompiledModel. A cancelled caller does
      * not interrupt in-flight native work.
+     *
+     * @param accelerator which model export to compile for (default NPU — the
+     * production path). The CPU path uses the pinned i8 CPU export and must not
+     * depend on NPU availability.
      */
-    suspend fun transcribe(wav: File): String = gate.withExclusiveAccess { transcribeBlocking(wav) }
+    suspend fun transcribe(
+        wav: File,
+        accelerator: ParakeetAccelerator = ParakeetAccelerator.NPU,
+    ): String = gate.withExclusiveAccess { transcribeBlocking(wav, accelerator) }
 
-    private fun transcribeBlocking(wav: File): String {
-        ensureLoaded()
+    private fun transcribeBlocking(wav: File, accelerator: ParakeetAccelerator): String {
+        ensureLoaded(accelerator)
         val mel = preprocessor!!
         val tok = tokenizer!!
         val overlap = FILE_AUDIO_CHUNK_OVERLAP_DURATION
@@ -203,7 +271,7 @@ class ParakeetAsrEngine(private val context: Context) : AutoCloseable {
                                 // closes a handle another caller may be invoking (SIGSEGV
                                 // class). The engine stays loaded; the next caller starts
                                 // from a fresh window on the still-valid handle.
-                                throw enrich("window=$window recognize", t)
+                                throw enrich(accelerator, "window=$window recognize", t)
                             }
                             for ((tokenId, timestamp) in tokens) {
                                 val decoded = try {
@@ -261,15 +329,24 @@ class ParakeetAsrEngine(private val context: Context) : AutoCloseable {
         recognizer = null
         tokenizer = null
         preprocessor = null
+        loadedAccelerator = null
     }
 
-    private fun enrich(stage: String, t: Throwable): IllegalStateException {
+    private fun enrich(
+        accelerator: ParakeetAccelerator,
+        stage: String,
+        t: Throwable,
+    ): IllegalStateException {
         val litert = generateSequence(t) { it.cause }.filterIsInstance<LiteRtException>().firstOrNull()
         val detail = buildString {
-            append("Parakeet NPU failed at $stage: ${t.message}")
+            append("Parakeet $accelerator failed at $stage: ${t.message}")
             if (litert != null) append(" | LiteRtException status=${litert.message}")
             append(" | soc=${Build.SOC_MODEL}")
-            append(" | model=${ParakeetLocalModels.npuModel(appContext).name}")
+            val model = when (accelerator) {
+                ParakeetAccelerator.NPU -> ParakeetLocalModels.npuModel(appContext).name
+                ParakeetAccelerator.CPU -> ParakeetLocalModels.cpuModel(appContext).name
+            }
+            append(" | model=$model")
         }
         Log.e(TAG, detail, t)
         return IllegalStateException(detail, t)

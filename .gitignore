@@ -20,3 +20,6 @@ captures/
 # Local-only large binary artifacts (already on disk; not source)
 phone-data-backup/
 phone-apk/
+
+# On-device benchmark outputs (scripts/run-cpu-benchmark.sh)
+benchmark-results/
