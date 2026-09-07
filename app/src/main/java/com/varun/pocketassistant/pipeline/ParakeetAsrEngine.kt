@@ -19,8 +19,6 @@ import com.google.ai.edge.litert.NpuCompatibilityChecker
 import java.io.File
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 /**
  * On-device Parakeet TDT ASR via LiteRT on Google Tensor TPU.
@@ -33,8 +31,9 @@ import kotlinx.coroutines.withContext
  * Device-required deltas vs stock sample (documented):
  * - npuOnly=true for AOT Tensor G5 packs
  * - TdtDecoder resets RNN state index per window
- * - Sequential windows (sample pipelines for UI; NPU is single-flight)
- * - Reload CompiledModel on mid-file NPU invoke flake and continue
+ * - Single-flight + single-thread native access (NativeEngineGate); abort the
+ *   whole file on a mid-file NPU invoke flake instead of reload-and-continue
+ *   (reloading a shared in-use CompiledModel is the SIGSEGV source)
  */
 object ParakeetLocalModels {
     const val REL_DIR = "models/parakeet"
@@ -87,6 +86,12 @@ object ParakeetLocalModels {
 
 class ParakeetAsrEngine(private val context: Context) : AutoCloseable {
     private val appContext = context.applicationContext
+    /**
+     * Single-flight + single-thread gate for the non-thread-safe LiteRT
+     * CompiledModel. All load/preprocess/decode/close work runs through it so a
+     * shared handle is never closed while another caller is invoking it.
+     */
+    private val gate = NativeEngineGate()
     private var recognizer: LiteRtRunner? = null
     private var tokenizer: HuggingfaceTokenizer? = null
     private var preprocessor: MelSpectroProcessor? = null
@@ -94,7 +99,7 @@ class ParakeetAsrEngine(private val context: Context) : AutoCloseable {
 
     val providerLabel: String = "parakeet_tdt_npu"
 
-    fun ensureLoaded() {
+    private fun ensureLoaded() {
         if (recognizer != null) return
         require(ParakeetLocalModels.isAvailable(appContext)) {
             "Parakeet Tensor G5 NPU pack missing or device unsupported " +
@@ -145,8 +150,14 @@ class ParakeetAsrEngine(private val context: Context) : AutoCloseable {
     /**
      * File transcription matching litert-samples MainActivity.processFileAudio parameters,
      * after aggressive silence trim + time-compression.
+     *
+     * Single-flight and pinned to the engine's serial dispatcher: concurrent
+     * callers queue instead of sharing the CompiledModel. A cancelled caller does
+     * not interrupt in-flight native work.
      */
-    fun transcribe(wav: File): String {
+    suspend fun transcribe(wav: File): String = gate.withExclusiveAccess { transcribeBlocking(wav) }
+
+    private fun transcribeBlocking(wav: File): String {
         ensureLoaded()
         val mel = preprocessor!!
         val tok = tokenizer!!
@@ -181,26 +192,18 @@ class ParakeetAsrEngine(private val context: Context) : AutoCloseable {
                         val confirmedParts = mutableListOf<String>()
                         var lastUnconfirmed = ""
                         var window = 0
-                        var invokeFlakes = 0
                         for (chunk in source.getAudioData()) {
                             window++
                             val features = mel.process(chunk.copyOf())
                             val tokens = try {
                                 recognizer!!.recognize(features).toList()
                             } catch (t: Throwable) {
-                                invokeFlakes++
-                                Log.e(
-                                    TAG,
-                                    "window=$window recognize failed (reload+continue): ${t.message}",
-                                    t,
-                                )
-                                try {
-                                    recognizer?.close()
-                                } catch (_: Throwable) {
-                                }
-                                recognizer = null
-                                ensureLoaded()
-                                emptyList()
+                                // Abort the whole file on a failed window: reloading the
+                                // shared CompiledModel mid-file resets decoder state and
+                                // closes a handle another caller may be invoking (SIGSEGV
+                                // class). The engine stays loaded; the next caller starts
+                                // from a fresh window on the still-valid handle.
+                                throw enrich("window=$window recognize", t)
                             }
                             for ((tokenId, timestamp) in tokens) {
                                 val decoded = try {
@@ -231,7 +234,7 @@ class ParakeetAsrEngine(private val context: Context) : AutoCloseable {
                         }
                         Log.i(
                             TAG,
-                            "Transcribe done chars=${text.length} windows=$window flakes=$invokeFlakes " +
+                            "Transcribe done chars=${text.length} windows=$window " +
                                 "wallMs=$wallMs origMs=${prep.originalDurationMs} prepMs=${prep.processedDurationMs} " +
                                 "rtfOrig=${"%.3f".format(rtfOrig)} rtfPrep=${"%.3f".format(rtfPrep)} " +
                                 "(rtfOrig=wall/original; <0.5 means >=2x vs meeting time)",
@@ -246,6 +249,12 @@ class ParakeetAsrEngine(private val context: Context) : AutoCloseable {
     }
 
     override fun close() {
+        // Waits for in-flight native work before disposing; never closes an
+        // in-use handle (the SIGSEGV source).
+        gate.close { closeBlocking() }
+    }
+
+    private fun closeBlocking() {
         recognizer?.close()
         tokenizer?.close()
         preprocessor?.close()
@@ -275,6 +284,3 @@ class ParakeetAsrEngine(private val context: Context) : AutoCloseable {
         private const val FILE_MAX_LEVENSHTEIN_DISTANCE = 5
     }
 }
-
-suspend fun ParakeetAsrEngine.transcribeSuspend(wav: File): String =
-    withContext(Dispatchers.Default) { transcribe(wav) }

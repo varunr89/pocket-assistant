@@ -579,7 +579,7 @@ class ParakeetAsrProvider(
     override fun isAvailable(): Boolean = ParakeetLocalModels.isAvailable(context.applicationContext)
 
     override suspend fun transcribe(wav: File): AsrResult {
-        val text = engine.transcribeSuspend(wav)
+        val text = engine.transcribe(wav)
         if (text.isBlank()) error("Parakeet returned empty transcript")
         return AsrResult(plain = text, diarized = null, providerId = engine.providerLabel)
     }

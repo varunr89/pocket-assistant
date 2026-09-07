@@ -201,6 +201,14 @@ class AudioCaptureEngine(
     }
 
     private suspend fun runCaptureLoop(sessionId: String) {
+        // Defensive re-check: start() verifies the permission, but it can be
+        // revoked between start() and this loop. Also satisfies lint
+        // MissingPermission next to the AudioRecord constructor.
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            error("Microphone permission missing")
+        }
         val minBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
