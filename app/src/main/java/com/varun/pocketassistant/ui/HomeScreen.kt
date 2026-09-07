@@ -39,7 +39,6 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -200,6 +199,12 @@ fun HomeScreen(
         }
     }
 
+    // Permission-grant bootstrap. There is no hero Start/Stop: the schedule
+    // owns the mic and the override toggle is the only manual on/off, so the
+    // first-run permission prompt runs as soon as the screen composes (and
+    // again on every open until granted).
+    LaunchedEffect(Unit) { ensurePermissionsAndStart() }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -243,10 +248,8 @@ fun HomeScreen(
                 CaptureHero(
                     stats = stats,
                     error = stats.lastError ?: permissionHint,
-                    onStart = { ensurePermissionsAndStart() },
                     onPause = viewModel::pauseRecording,
                     onResume = viewModel::resumeRecording,
-                    onStop = viewModel::stopRecording,
                 )
 
                 if (stats.state == CaptureState.SCHEDULED_OFF) {
@@ -1012,10 +1015,8 @@ private fun RecordingRow(
 private fun CaptureHero(
     stats: CaptureStats,
     error: String?,
-    onStart: () -> Unit,
     onPause: () -> Unit,
     onResume: () -> Unit,
-    onStop: () -> Unit,
 ) {
     val state = stats.state
     val speechActive = stats.speechActive
@@ -1102,33 +1103,11 @@ private fun CaptureHero(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             when (state) {
-                CaptureState.IDLE -> {
-                    Button(
-                        onClick = onStart,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.primary,
-                        ),
-                    ) {
-                        Icon(Icons.Default.Mic, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Start")
-                    }
-                }
                 CaptureState.RECORDING -> {
                     FilledTonalButton(onClick = onPause) {
                         Icon(Icons.Default.Pause, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
                         Text("Pause")
-                    }
-                    Button(
-                        onClick = onStop,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.tertiary,
-                        ),
-                    ) {
-                        Icon(Icons.Default.Stop, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Stop")
                     }
                 }
                 CaptureState.PAUSED -> {
@@ -1137,15 +1116,14 @@ private fun CaptureHero(
                         Spacer(Modifier.width(8.dp))
                         Text("Resume")
                     }
-                    FilledTonalButton(onClick = onStop) {
-                        Icon(Icons.Default.Stop, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Stop")
-                    }
                 }
-                CaptureState.SCHEDULED_OFF -> {
-                    // The capture schedule owns the mic here; the override
-                    // switch below the hero is the single manual control.
+                CaptureState.IDLE,
+                CaptureState.SCHEDULED_OFF,
+                -> {
+                    // No manual start/stop: the schedule owns the mic and the
+                    // override switch (below / in Settings) is the ONLY on/off
+                    // control. Start is bootstrapped by the permission flow;
+                    // stopping only happens by design (schedule), never by tap.
                 }
             }
         }

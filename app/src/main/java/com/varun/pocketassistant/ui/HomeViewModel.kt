@@ -202,10 +202,6 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         RecordingService.resume(getApplication())
     }
 
-    fun stopRecording() {
-        RecordingService.stop(getApplication())
-    }
-
     /** Manual "mic on outside schedule" override — the only manual on/off. */
     fun setCaptureOverride(enabled: Boolean) {
         viewModelScope.launch {

@@ -69,11 +69,6 @@ class RecordingService : Service() {
                 startAsForeground()
                 engine.resume()
             }
-            ACTION_STOP -> {
-                engine.stop()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-            }
             else -> {
                 startAsForeground()
                 engine.start()
@@ -147,13 +142,15 @@ class RecordingService : Service() {
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
 
         if (stats.phase == CapturePhase.SCHEDULED_OFF) {
-            // The schedule owns the mic while gated; no pause/resume here.
+            // The schedule owns the mic while gated; no pause/resume here,
+            // and no stop action anywhere: the override toggle is the only
+            // manual on/off control (spec AC1), so nothing can stopSelf()
+            // the service and silently kill capture for the rest of the day.
         } else if (stats.state == CaptureState.RECORDING) {
             builder.addAction(0, "Pause", servicePendingIntent(ACTION_PAUSE, 1))
         } else if (stats.state == CaptureState.PAUSED) {
             builder.addAction(0, "Resume", servicePendingIntent(ACTION_RESUME, 2))
         }
-        builder.addAction(0, "Stop", servicePendingIntent(ACTION_STOP, 3))
 
         return builder.build()
     }
@@ -194,7 +191,6 @@ class RecordingService : Service() {
         const val ACTION_START = "com.varun.pocketassistant.action.START"
         const val ACTION_PAUSE = "com.varun.pocketassistant.action.PAUSE"
         const val ACTION_RESUME = "com.varun.pocketassistant.action.RESUME"
-        const val ACTION_STOP = "com.varun.pocketassistant.action.STOP"
 
         fun start(context: Context) {
             context.startForegroundService(
@@ -211,12 +207,6 @@ class RecordingService : Service() {
         fun resume(context: Context) {
             context.startForegroundService(
                 Intent(context, RecordingService::class.java).setAction(ACTION_RESUME),
-            )
-        }
-
-        fun stop(context: Context) {
-            context.startService(
-                Intent(context, RecordingService::class.java).setAction(ACTION_STOP),
             )
         }
     }

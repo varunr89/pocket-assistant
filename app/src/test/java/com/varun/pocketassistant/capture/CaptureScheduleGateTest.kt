@@ -3,6 +3,7 @@ package com.varun.pocketassistant.capture
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.ZoneId
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -19,13 +20,9 @@ import org.junit.Test
  * Runtime capture gate (M1 meeting-layer increment 3a): the authority the
  * capture engine obeys. The engine's contract is that while the gate is
  * closed the mic stays released and NO frame is processed — these tests pin
- * the gate's transitions over virtual time: window boundaries tick into
- * effect and the override flips it live without waiting for a tick. The
- * [CaptureScheduleGate.awaitOpen] tests pin the frame-precise entry the
- * engine actually suspends on.
+ * the gate's transitions over a virtual clock, exactly as production reads
+ * them ([CaptureScheduleGate.isOpenNow] / [awaitOpen]).
  *
- * The gate's collection (including its infinite boundary ticker) runs in the
- * test backgroundScope so runTest does not wait on the never-ending ticker.
  * Same JUnit-4.8 assertion surface as [CaptureScheduleTest] (jlibrosa
  * shadowing blocks assertThrows/@Rule).
  */
@@ -34,107 +31,107 @@ class CaptureScheduleGateTest {
 
     private val zone = ZoneId.of("UTC")
     private val monday = LocalDate.of(2026, 9, 7)
-    private val tickMs = 60_000L
 
     private fun at(date: LocalDate, time: LocalTime): Long =
         date.atTime(time).atZone(zone).toInstant().toEpochMilli()
+
+    private fun gate(
+        scope: CoroutineScope,
+        schedule: MutableStateFlow<WeeklyCaptureSchedule>,
+        zone: ZoneId = this.zone,
+        clock: () -> Long,
+    ): CaptureScheduleGate = CaptureScheduleGate(
+        scheduleFlow = schedule,
+        scope = scope,
+        clockMs = clock,
+        zone = { zone },
+    )
 
     @Test
     fun closedBeforeWindowOpensAtExactly0800() = runTest {
         var now = at(monday, LocalTime.of(7, 30))
         val schedule = MutableStateFlow(WeeklyCaptureSchedule())
-        val gate = CaptureScheduleGate(
-            scheduleFlow = schedule,
-            scope = backgroundScope,
-            tickMs = tickMs,
-            clockMs = { now },
-            zone = { zone },
-        )
+        val gate = gate(backgroundScope, schedule) { now }
         runCurrent()
-        assertFalse(gate.open.value) // 07:30 — ahead of the window
+        assertFalse(gate.isOpenNow()) // 07:30 — ahead of the window
 
         now = at(monday, LocalTime.of(7, 59))
-        advanceTimeBy(tickMs + 1)
-        runCurrent()
-        assertFalse(gate.open.value) // still just before the window
+        assertFalse(gate.isOpenNow()) // still just before the window
 
         // Boundary: exactly 08:00 opens (start is minute-inclusive).
         now = at(monday, LocalTime.of(8, 0))
-        advanceTimeBy(tickMs + 1)
-        runCurrent()
-        assertTrue(gate.open.value)
+        assertTrue(gate.isOpenNow())
     }
 
     @Test
     fun openDuringWindowClosesAtExactly1700() = runTest {
         var now = at(monday, LocalTime.of(12, 0))
         val schedule = MutableStateFlow(WeeklyCaptureSchedule())
-        val gate = CaptureScheduleGate(
-            scheduleFlow = schedule,
-            scope = backgroundScope,
-            tickMs = tickMs,
-            clockMs = { now },
-            zone = { zone },
-        )
+        val gate = gate(backgroundScope, schedule) { now }
         runCurrent()
-        assertTrue(gate.open.value)
+        assertTrue(gate.isOpenNow())
 
         now = at(monday, LocalTime.of(16, 59))
-        advanceTimeBy(tickMs + 1)
-        runCurrent()
-        assertTrue(gate.open.value)
+        assertTrue(gate.isOpenNow())
 
         // Boundary: exactly 17:00 closes (end is minute-exclusive).
         now = at(monday, LocalTime.of(17, 0))
-        advanceTimeBy(tickMs + 1)
-        runCurrent()
-        assertFalse(gate.open.value)
+        assertFalse(gate.isOpenNow())
     }
 
     @Test
-    fun overrideFlipsGateLiveWithoutWaitingForATick() = runTest {
+    fun overrideFlipsGateLiveWithoutWaitingForAPoll() = runTest {
         // Monday 02:00 — hours outside the window.
         val now = at(monday, LocalTime.of(2, 0))
         val schedule = MutableStateFlow(WeeklyCaptureSchedule())
-        val gate = CaptureScheduleGate(
-            scheduleFlow = schedule,
-            scope = backgroundScope,
-            tickMs = tickMs,
-            clockMs = { now },
-            zone = { zone },
-        )
+        val gate = gate(backgroundScope, schedule) { now }
         runCurrent()
-        assertFalse(gate.open.value)
+        assertFalse(gate.isOpenNow())
 
-        // (a)/(c) override on -> gate opens immediately from the flow change;
-        // the engine does not wait for the next 60s tick.
+        // Override on -> gate opens immediately once the latest-schedule
+        // tracker absorbs the flow change; the engine does not wait for a
+        // boundary poll round.
         schedule.value = schedule.value.copy(overrideEnabled = true)
         runCurrent()
-        assertTrue(gate.open.value)
+        assertTrue(gate.isOpenNow())
 
         schedule.value = schedule.value.copy(overrideEnabled = false)
         runCurrent()
-        assertFalse(gate.open.value)
+        assertFalse(gate.isOpenNow())
     }
 
     @Test
     fun weekendStaysClosedAndMondayWindowReopens() = runTest {
         var now = at(monday.minusDays(1), LocalTime.of(22, 0)) // Sunday 22:00
         val schedule = MutableStateFlow(WeeklyCaptureSchedule())
-        val gate = CaptureScheduleGate(
-            scheduleFlow = schedule,
-            scope = backgroundScope,
-            tickMs = tickMs,
-            clockMs = { now },
-            zone = { zone },
-        )
+        val gate = gate(backgroundScope, schedule) { now }
         runCurrent()
-        assertFalse(gate.open.value) // Sunday night — weekend, closed
+        assertFalse(gate.isOpenNow()) // Sunday night — weekend, closed
 
         now = at(monday, LocalTime.of(8, 0))
-        advanceTimeBy(tickMs + 1)
-        runCurrent()
-        assertTrue(gate.open.value) // Monday 08:00 — the schedule reopens it
+        assertTrue(gate.isOpenNow()) // Monday 08:00 — the schedule reopens it
+    }
+
+    @Test
+    fun zoneIsRespectedSameInstantOpensLocallyButClosesInUtc() = runTest {
+        // Monday 23:30 UTC == Monday 16:30 America/Los_Angeles (PDT, UTC-7):
+        // inside 08:00-17:00 local time the gate is open, while the same
+        // instant is after 17:00 in UTC. Pins that production's
+        // ZoneId.systemDefault() evaluation (not a hard-coded UTC) is the
+        // contract — the injected zone is honored per gate.
+        val instant = at(monday, LocalTime.of(23, 30))
+        val laGate = gate(
+            backgroundScope,
+            MutableStateFlow(WeeklyCaptureSchedule()),
+            ZoneId.of("America/Los_Angeles"),
+            { instant },
+        )
+        val utcGate = gate(
+            backgroundScope,
+            MutableStateFlow(WeeklyCaptureSchedule()),
+        ) { instant }
+        assertTrue(laGate.isOpenNow()) // 16:30 Monday in LA — window open
+        assertFalse(utcGate.isOpenNow()) // 23:30 Monday in UTC — window closed
     }
 
     // ---- awaitOpen: the frame-precise entry the engine suspends on ----
@@ -143,13 +140,7 @@ class CaptureScheduleGateTest {
     fun awaitOpenSuspendsWhileClosedThenReturnsAtBoundary() = runTest {
         var now = at(monday, LocalTime.of(7, 59))
         val schedule = MutableStateFlow(WeeklyCaptureSchedule())
-        val gate = CaptureScheduleGate(
-            scheduleFlow = schedule,
-            scope = backgroundScope,
-            tickMs = tickMs,
-            clockMs = { now },
-            zone = { zone },
-        )
+        val gate = gate(backgroundScope, schedule) { now }
         var opened: Boolean? = null
         backgroundScope.launch { opened = gate.awaitOpen() }
         runCurrent()
@@ -171,13 +162,7 @@ class CaptureScheduleGateTest {
     fun awaitOpenPicksUpOverrideWithinOnePoll() = runTest {
         val now = at(monday, LocalTime.of(2, 0))
         val schedule = MutableStateFlow(WeeklyCaptureSchedule())
-        val gate = CaptureScheduleGate(
-            scheduleFlow = schedule,
-            scope = backgroundScope,
-            tickMs = tickMs,
-            clockMs = { now },
-            zone = { zone },
-        )
+        val gate = gate(backgroundScope, schedule) { now }
         var opened: Boolean? = null
         backgroundScope.launch { opened = gate.awaitOpen() }
         runCurrent()
@@ -185,7 +170,7 @@ class CaptureScheduleGateTest {
 
         schedule.value = schedule.value.copy(overrideEnabled = true)
         runCurrent() // the latest-schedule tracker absorbs the override
-        advanceTimeBy(1_100) // <= 1 poll round of waiting (not 60s tick)
+        advanceTimeBy(1_100) // <= 1 poll round of waiting
         runCurrent()
         assertEquals(true, opened)
     }

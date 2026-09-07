@@ -87,12 +87,17 @@ class AudioCaptureEngine(
                 totalBytesWritten = 0
                 framesRead = 0
                 rmsHistory.clear()
-                phase = CapturePhase.LISTENING
-                pushEvent("Capture started")
+                // Gate-aware initial publish: starting outside the schedule
+                // must surface as SCHEDULED_OFF immediately (mic released),
+                // never as a transient LISTENING before the loop closes the
+                // gate a few ms later.
+                val gateOpen = gate.isOpenNow()
+                phase = if (gateOpen) CapturePhase.LISTENING else CapturePhase.SCHEDULED_OFF
+                pushEvent(if (gateOpen) "Capture started" else "Capture started — outside schedule, mic off")
                 publish(
                     CaptureStats(
-                        state = CaptureState.RECORDING,
-                        phase = CapturePhase.LISTENING,
+                        state = if (gateOpen) CaptureState.RECORDING else CaptureState.SCHEDULED_OFF,
+                        phase = phase,
                         sessionId = session.id,
                         segmentCount = session.segmentCount,
                         speechThreshold = vad.speechThreshold,
@@ -168,38 +173,18 @@ class AudioCaptureEngine(
                     com.varun.pocketassistant.data.SessionStatus.RECORDING,
                 )
             }
-            phase = CapturePhase.LISTENING
-            pushEvent("Resumed")
+            // Gate-aware (sibling of start()): never flash LISTENING while the
+            // schedule holds the mic off; the loop re-authorizes per frame.
+            val gateOpen = gate.isOpenNow()
+            phase = if (gateOpen) CapturePhase.LISTENING else CapturePhase.SCHEDULED_OFF
+            pushEvent(if (gateOpen) "Resumed" else "Resumed — outside schedule, mic off")
             publish(
                 _stats.value.copy(
-                    state = CaptureState.RECORDING,
-                    phase = CapturePhase.LISTENING,
+                    state = if (gateOpen) CaptureState.RECORDING else CaptureState.SCHEDULED_OFF,
+                    phase = phase,
                     events = events.toList(),
                 ),
             )
-        }
-    }
-
-    fun stop() {
-        paused = false
-        val sessionId = _stats.value.sessionId
-        captureJob?.cancel()
-        captureJob = null
-        scope.launch {
-            mutex.withLock {
-                closeWriterIfNeeded(finalize = true)
-            }
-            releaseRecorder()
-            if (sessionId != null) {
-                sessionRepository.setStatus(
-                    sessionId,
-                    com.varun.pocketassistant.data.SessionStatus.COMPLETED,
-                )
-                sessionRepository.applyRetention()
-            }
-            pushEvent("Stopped")
-            phase = CapturePhase.IDLE
-            publish(CaptureStats(events = events.toList(), speechThreshold = vad.speechThreshold))
         }
     }
 
