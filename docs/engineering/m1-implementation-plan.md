@@ -1,80 +1,68 @@
-# M1 — Fresh-eyes review and implementation plan
+# M1 — Foreground-gated ML Kit GenAI ASR: re-scoped implementation plan
 
-Status: PROPOSAL for Varun's approval; planning only, no implementation/deployment/commit authorized here. Locked requirements remain unchanged.
-Basis: `AGENTS.md`, `docs/product-vision.md`, `docs/roadmap.md`, `docs/engineering/{architecture-final,m1-investigation,m1-fix-plan}.md`, `docs/research/*`, and current source.
-Code paths below are relative to `app/src/main/java/com/varun/pocketassistant/`; `U/` means `app/src/main/java/com/google/ai/edge/examples/asr/`. Other paths are repo-root; NEW means proposed, not existing.
+Status: ACTIVE after Varun's 2026-09-06 product decision (option A — foreground-only official transcription). Supersedes the CPU-first sherpa plan (committed in 0322ae9) for all not-yet-landed increments. Landed work is reassessed below; nothing is reverted without cause.
+Basis: `AGENTS.md`, `docs/product-vision.md`, `docs/engineering/architecture-final.md` (amended same day), and current source.
 
-## Fresh-eyes verdict
-- Make sherpa-onnx CPU int8 the leading candidate, not a last-resort Plan B. Tensor NPU support is beta; Anotta reports shipping sherpa on Android, but that does NOT prove our Pixel energy/quality budget.[3][4] Benchmark early, before bespoke NPU recovery. The 15–60-minute TTV contract favors correctness over peak inference speed.
-- Keep F1, expand its ownership boundary; reject F2 as the default investment. Current failures discard whole windows (`pipeline/ParakeetAsrEngine.kt:188–203`); `U/TdtDecoder.kt:67–72` already resets state every window. “Reload destroys cross-window decoder context” is not established. Per-window cross-runtime splicing adds correctness risk; a Kotlin catch cannot recover SIGSEGV.
-- F3 is an experiment, not a promised cure: `timeCompress` changes pitch (`pipeline/AsrAudioPreprocessor.kt:187`), but deterministic output does not distinguish frontend, merger, export, or runtime faults. The 2s/2s-right/10s-left recipe is NeMo buffered inference, not our fixed five-second export's input contract.[8] Do not change window constants blindly.
-- Reject F4's unconditional blank→silence: it would conceal ASR failure and speech loss. Fix both providers' incomplete-output semantics, not merely their symmetry. Keep F5's duration correction; retain F6 provenance/crash reporting, but neither a one-second probe nor blindly removing `npuOnly` proves reliability (`U/LiteRtRunner.kt:37–40`).
-- Reject numerical promises of post-fix WER. Investigation's 47–85% is versus cloud proxies, not human truth; NVIDIA reports AMI 11.31%, a warning rather than a mathematical accuracy ceiling.[8] “No production NPU app found” is limited evidence, not proof none exists.
-- This is more than ASR: local work currently requires connectivity (`pipeline/work/PipelineScheduler.kt:23–26`); missing files become “silence” (`speech/AsrStage.kt:53–60`). Native inference shares the capture process, and full locked enrichment/sync/MCP gates are not implemented in this tree. A local transcript demo cannot certify M1.
+## Product decision (product intent, not to be relitigated here)
+- Capture stays PASSIVE/BACKGROUND and unchanged: mic → VAD → 16k mono segments → raw audio kept on-device, 30-day Opus rolling window.
+- Transcription moves to the FOREGROUND using Google's official on-device ASR: the ML Kit GenAI Speech Recognition API, Advanced Mode (Gemini Nano via AICore), natively supported on Pixel 10 and Pixel 11 series.
+- Catch-up transcription must be fast so the user doesn't wait long; the user picked option A = foreground-only official transcription, accepting that segments transcribe when the app is next opened/foreground. SLO 6 becomes a measured foreground catch-up rate (see `architecture-final.md` §5).
 
-## Execution contract
-Each increment: Varun approves scope → regression test RED → minimal fix GREEN → `./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug` → review, commit + push on main when authorized → rebuild from that clean pushed SHA → targeted device tests → evidence + Varun acceptance before the next increment. A failed device gate is reported, never waived by a green build.
-Bootstrap NEW `app/src/test/` and `app/src/androidTest/` tests/dependencies in increment 1 (`app/build.gradle.kts` currently has no test suite/dependencies beyond the Compose BOM). Run `:app:connectedDebugAndroidTest` only on the approved clean build; preserve real user data/settings and use isolated fixtures. Effort XS/S/M is engineering scope, not elapsed soak time.
+## What changes vs the old plan
+- The old leading candidate (sherpa-onnx CPU int8) is demoted to parked plan-B together with Parakeet/LiteRT. Parked harness files are NOT deleted — see "Parked" below.
+- Old increments 2 (freemium local default), 3 (silence semantics), 5 (input policy) and 6 (promote winner) are re-scoped onto the ML Kit path and renumbered below. Old increment 7 (capture/save chronology) and 8 (qualification) keep their requirements, renumbered.
+- Increment 1 (native lifecycle discipline, d1a89a6) STAYS foundational: the capture engine and any future LiteRT plan-B share the same single-flight lifecycle contract. The ML Kit path does not run through NativeEngineGate (AICore owns its own lifecycle), but the concurrency discipline it forced onto the tree is never regressed.
+- Increment 4 (CPU-first benchmark, 485f54d) STAYS as parked measurement tooling, not a production path.
 
-## Ordered increments
-### 1. Own the native lifecycle — S; medium risk (native lifetime)
-Change: `pipeline/ParakeetAsrEngine.kt` (`ensureLoaded`, `transcribe`, `transcribeSuspend`, `close`) and `CloudAndLocalProviders.kt:ParakeetAsrProvider`: one engine-owned serial dispatcher plus mutex across load, preprocessing, lazy decoder consumption, disposal; no public bypass through `Dispatchers.Default`. Abort on a failed window instead of reload-and-drop; disposal waits for in-flight native work.
-Verify/gate: barrier-controlled concurrent callers, invoke-error injection, close-during-invoke and cancelled retry versus new capture; assert one live inference/handle, no partial READY. Repeat the investigation's overlapping on-device requeue/capture repro; inspect logcat/exit records for zero observed native crashes. Cancellation must not unlock/dispose while native code still runs.
+## API surface verification (done 2026-09-06, before any code)
+- Artifact: `com.google.mlkit:genai-speech-recognition:1.0.0-alpha1` (Google Maven). ALPHA — no SLA or deprecation policy, breaking changes possible; pin exact version, re-verify on bump.
+- Verified against the official guide (developers.google.com/ml-kit/genai/speech-recognition/android), the official sample (googlesamples/mlkit, android/speech/SpeechRecognitionActivity.kt) AND bytecode (`javap` on the shipped classes.jar):
+  - `SpeechRecognition.getClient(speechRecognizerOptions { locale = …; preferredMode = … })`; modes `SpeechRecognizerOptions.Mode.MODE_BASIC / MODE_ADVANCED`.
+  - `SpeechRecognizer`: `suspend checkStatus(): Int?` (vs `FeatureStatus.{AVAILABLE, DOWNLOADABLE, DOWNLOADING, UNAVAILABLE}`), `download(): Flow<DownloadStatus>`, `startRecognition(request): Flow<SpeechRecognizerResponse>`, `suspend stopRecognition()`, `close()`.
+  - `speechRecognizerRequest { audioSource = AudioSource.fromPfd(pfd) /* or fromMic() */ }`.
+  - `SpeechRecognizerResponse` sealed: `PartialTextResponse(text)` (may change), `FinalTextResponse(text)` (accumulate), `CompletedResponse` (session end), `ErrorResponse(e: GenAiException)`. Non-streaming = collect one flow to completion.
+  - `GenAiException.ErrorCode`: `BUSY = 9`, `PER_APP_BATTERY_USE_QUOTA_EXCEEDED = 27`, `BACKGROUND_USE_BLOCKED = 30` (official GenAiException reference; codes are const-verified).
+- Hard input contract for file audio (official docs): raw headerless PCM16, mono, 16 kHz, delivered to the file descriptor at a REAL-TIME rate — full-speed reads from a regular file are NOT supported. Consequence: catch-up is paced (≈1× audio duration) via a pipe from the segment WAV (our capture already writes 16k mono PCM16 with a 44-byte RIFF header to strip). The 1× pacing floor means SLO 6 is measured, not assumed — and whether AICore accepts faster feeding is a device-only experiment, never assumed in code.
+- AICore runtime contract (recorded in `architecture-final.md` §5): on-device system service, data stays local, per-app quotas, foreground-only inference.
 
-### 2. Prove the local path and create the measurement harness — M; medium risk (privacy/schema)
-Change: `pipeline/PipelineConfig.kt`, `Providers.kt:ProviderRouter`, `pipeline/work/PipelineScheduler.kt:enqueueAsr`, `ui/PipelineSettingsScreen.kt`: freemium defaults to `PREFER_LOCAL` with ASR cloud fallback disabled; separate ASR-upload consent from text fallback, preserve explicit cloud choices. Local jobs must run offline. Add attempt provenance/timing via `PipelineTelemetry`, `data/AppDatabase.kt`, `SessionRepository`; fix F5 using parsed PCM duration, not total WAV bytes.
-Verify/gate: NEW `app/src/androidTest/.../M1AsrTest.kt` and `scripts/m1-slo.py`: airplane-mode capture reaches the real local provider; online fault tests with a configured cloud spy show zero ASR uploads, including unavailable-model paths. Persist the effective backend on successes, skips AND failures; reconstruct a result after process restart. Freeze the consented corpus/measurement manifest before tuning.
+## Ordered increments (small; each = files, green `./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug`, commit + push main, report)
 
-### 3. Silence is evidence, not empty text — S; medium risk (false speech rejection)
-Change: `pipeline/Providers.kt:AsrResult`, both ASR providers in `CloudAndLocalProviders.kt`, `AsrAudioPreprocessor.prepare`, `speech/AsrStage.process`: typed complete/no-speech/error outcomes; conservative validated-audio no-speech preflight BEFORE model load/upload. Blank speech, missing/corrupt audio and failed windows/chunks remain visible failures, not SKIPPED_SILENCE; policy skips stay distinct. Never publish incomplete text as complete READY.
-Verify/gate: valid silence, room tone, quiet/brief speech, truncated/missing WAV, all-window failure and partial failure for BOTH providers. Silence incurs no model load/network/retry; quiet speech is not erased; real failure preserves diagnostics/audio. Device fixtures must reach the correct visible state, not merely return an empty string.
+### 1. Docs re-scope — DONE (this commit)
+`architecture-final.md` ASR/SLO-6 rewrite + this plan. No code.
 
-### 4. CPU-first runtime comparison, bounded NPU diagnosis — M; medium risk (native packaging/energy)
-Change: NEW benchmark-only sherpa adapter in `app/src/androidTest/`, test dependencies in `app/build.gradle.kts`; explicit CPU control in `ParakeetLocalModels`/`ParakeetAsrEngine.ensureLoaded`; pin model/tokenizer/runtime revisions, checksums and artifact licenses in `scripts/push-local-models.sh`. CPU availability must not depend on NPU checks. Verify CPU weights actually exist; a `CPU_MODEL` constant is not a working fallback.
-Verify: run sherpa CPU int8, available LiteRT CPU and serialized LiteRT NPU on identical original 16k mono audio, speed 1.0/no destructive trim, using each artifact's reference frontend/decoder. Record cold/warm WER, failures, RTF, peak PSS, thermal state and unplugged energy; prove the adapter through the same provider/stage seam. The script selects f32-named NPU versus i8 CPU exports: verify quantization; do not call this a runtime-only controlled comparison.
-Gate: cap NPU version/dispatch/SoC diagnosis at one engineering day; unsupported or still-flaky configurations stay disabled. Prefer the simplest CPU candidate meeting measured quality/energy/queue budgets; stop for Varun if none does. No speculative per-window CPU fallback or automatic removal of the documented `npuOnly` workaround.
+### 2. Foundation: foreground-gated ML Kit GenAI ASR + catch-up drain — the first build increment
+- NEW `speech/MLKitGenAiAsrEngine.kt`: thin wrapper over the verified surface above. WAV header validation (16k mono PCM16 required — mismatch is a visible failure, never fed to AICore), pipe-based real-time-paced feeding, FinalTextResponse accumulation until CompletedResponse, typed failure classification, model `checkStatus()` + on-demand `download()`.
+- NEW foreground gate (activity-lifecycle-based `isForeground()`), drain processor and `TranscriptionDrainService`: claims PENDING segments only while the app is foreground; persists READY/SKIPPED_SILENCE/FAILED exactly like `AsrStage`; BUSY → exponential backoff; PER_APP_BATTERY_USE_QUOTA_EXCEEDED → defer that segment to the next day (recorded); BACKGROUND_USE_BLOCKED → expected state, recorded in diagnostics, drain waits. Not foreground → no-op and wait.
+- Unit tests (JVM, mocked recognizer + queue boundaries) for gating, claim/persist, and all four error classifications.
+- Untouched: capture, segment persistence, `ProviderRouter`/cloud wiring (`cloud_stt`) — the paid tier later. The drain takes ownership ONLY in local mode (PREFER_LOCAL); until increment 3 removes the legacy path's local-mode enqueue, a rare overlap with the background Parakeet worker is possible (last-write-wins on READY; noted as a known follow-up, not a correctness hazard).
+- Do not delete or rewire sherpa increment-4 harness files; mark them parked in docs only (done here).
 
-### 5. Establish the least-destructive input policy — S; medium risk (quality/latency)
-Change: add explicit trim control to `pipeline/AsrAudioPreprocessor.prepare`; local baseline is speed 1.0, trim off, capture VAD retained, original audio untouched. On the stable candidate, ablate {1.0, 1.35} × {trim off, on}; preserve original sample/time mapping. Audit `U/MelSpectroProcessor`, `FileAudioSource`, `TdtDecoder`, `LevenshteinTokenMerger` against the exact export before any context/decoder redesign.
-Verify/gate: paired human-reference scoring on clean, loud/far-field, quiet, short and rollover audio; compare sample counts, feature/token golden fixtures, boundary omissions/duplicates and timestamps. Keep fidelity-first defaults unless held-out evidence favors an alternative. A 2/2/10 experiment requires a compatible export/reference path, not just a new `inputMilliseconds` value.
+### 3. Routing: freemium = local via the drain
+`PipelineConfig` default flip for freemium (PREFER_LOCAL, ASR cloud fallback disabled) WITHOUT touching saved explicit cloud choices; stop enqueueing `AsrWorker` for local-mode segments so the foreground drain is the single local owner; cloud/paid path unchanged (`cloud_stt` still reachable when configured). Removes the increment-2 overlap note.
 
-### 6. Promote the winner; bound retries and expose crashes — M; medium risk (migration/recovery)
-Change: `data/AppContainer.kt` wires the approved provider; NEW `pipeline/SherpaAsrEngine.kt` if sherpa wins, with production dependency/artifact pinning. NPU is off by default; if later authorized, caught NPU failure restarts the WHOLE segment on proven CPU with fresh state, never mixed-window tokens. `AsrWorker`, `SessionRepository`, `AppDatabase`, `PocketAssistantApp.onCreate`, `ui/HomeScreen.kt`: durable attempt budget/start markers, cancellation propagation, next-launch `ApplicationExitInfo` correlation and visible interrupted/error state; no retry-budget reset on every launch.
-Verify/gate: real offline new capture + retry + backlog + local Gemma cleanup; missing pack, timeout, cancellation, process death and >50 pending jobs all drain or visibly terminate. Measure/revise the current whole-file five-minute local timeout for CPU/long files without unbounded retries. No simultaneous heavyweight backend loads; a persistent native crash/hang blocks release rather than triggering imaginary in-process recovery.
+### 4. Typed outcomes on the ML Kit path
+Port old increment 3 semantics: typed complete/no-speech/error outcomes; blank/validated-silence segments become SKIPPED_SILENCE without quota burn; incomplete final text is never published as READY; failures keep diagnostics and audio.
 
-### 7. Close capture/save and chronology gaps — M; high risk (data integrity)
-Change: regression-first fixes at `capture/RecordingService` stop/destroy, `AudioCaptureEngine.stop/processFrame/closeWriterIfNeeded`, `WavWriter`, `data/OrphanSessionImporter.importMissing`, `SessionRepository.addSegment`: await durable finalization before cancelling service scope, recover interrupted WAV payload/header, idempotently reconcile file↔row writes, use sample-based boundaries and remove duplicated rollover frames. Record unrecoverable gaps; never call them silence.
-Verify/gate: kill before/after file close and DB insert, stop/pause/restart, reboot and sustained speech across two-minute rolls plus legacy ten-minute files. Compare source sample coverage and IDs/times, not just row totals; repeated recovery adds no duplicates, capture is not starved by ASR, and every session settles visibly. Reboot downtime is disclosed, not claimed as captured audio.
+### 5. Model availability + first-run UX
+checkStatus/download flow surfacing (FeatureStatus.DOWNLOADABLE → guided download), AICore setup guidance for fresh/reset devices (feature config download can take minutes–hours; bootloader-unlocked devices unsupported), advanced-mode availability surfacing (Pixel 10/11 vs fallback).
 
-### 8. Qualification, not another demo — M; high risk; blocked on prerequisites below
-Change: extend NEW `scripts/m1-slo.py` and device tests into repeatable acceptance runs; produce a versioned, redacted `docs/engineering/m1-slo-results.md` with artifact IDs and all failures. No automatic corpus/audio/transcript upload or private fixture commit. Measurement-only results do not authorize shipping.
-Verify/gate: run the following protocol on each supported Pixel/SoC/firmware combination (Pixel 10 results do not certify Pixel 11), then ALL architecture §6 gates. Varun signs off on evidence or explicitly amends the contract; unimplemented dependencies are BLOCKED, not PASS/N/A.
+### 6. SLO 6 measurement (catch-up rate)
+Instrument drain throughput (audio-minutes per foreground-minute), queue delay, BUSY/quota/blocked counters; produce the honest baselines that define the SLO 6 target before qualification. Includes the faster-than-realtime feeding experiment (device-only evidence, gated behind a flag).
 
-## On-device SLO protocol (used from increment 4 onward)
-- Quality: 3–5 human-corrected real WAVs are calibration, not sufficient release proof; freeze a separate held-out, consented ambient set with declared clean/far-field/noisy/quiet/rollover strata. Score RAW ASR before enrichment with fixed normalization; report word-weighted WER, S/D/I/N, per-file/stratum results and session-level uncertainty. Failed/missing speech counts as deletions, not excluded samples; cloud transcripts are auxiliary comparisons only.
-- Speech coverage: silence has no WER denominator; report hallucinated words/time and false-silence counts separately. Review names, numbers, negations and original-time citations; enrichment cannot “repair” missing evidence or silently rewrite what a quotation means.
-- Provenance/stability: record git SHA, APK/model/tokenizer/runtime/dispatch hashes, actual backend, preprocessing flags, SoC/build, attempts, failed windows and queue delay. Repeated cold/warm runs plus an eight-hour capture/ASR/enrichment soak must show zero observed crashes/unreported losses; publish counts and observed failure rates, not “100% reliable.”
-- Energy/performance: at least two unplugged, screen-off one-hour runs per candidate at fixed speech duty cycle, including model load/ASR/backlog drain; compare idle and capture-only controls. Use `adb shell dumpsys batterystats`, charge-counter deltas, `dumpsys battery`, `dumpsys meminfo` and thermal readings; report gross and incremental %/hr against the 1–3%/hr budget. No charger, fake battery unplug, or deferred-compute accounting; sustained backlog must remain bounded.
-- Integrity/visibility: injected failures reconcile audio coverage, terminal states, segment IDs and content digests file↔Room↔Neon; preserve raw/clean provenance. Recovery exhaustion stays visible. Distinguish intentional retention/deletion from missing data; terminal FAILED is visible but still counts against reliability.
-- TTV/cost: trace capture timestamps → ASR → enrichment → sync acknowledgement → successful `fetch_range` (not ASR wall time), reporting the full 15–60-minute contract and offline backlog separately. Meter hosted usage/caps against ≤$7/month for six users; BYOK ≤5% WER is a separate opt-in test and can never satisfy the local ≤10% gate.
+### 7. Capture/save chronology gaps (old increment 7, unchanged)
+Regression-first fixes in RecordingService stop/destroy, AudioCaptureEngine stop/processFrame/close, WavWriter, OrphanSessionImporter, SessionRepository.addSegment: awaited finalization, interrupted WAV recovery, idempotent file↔row reconciliation, sample-based boundaries, no duplicated rollover frames. Provider-independent — required regardless of ASR path.
 
-## Full M1 prerequisites and architecture-final.md §6 acceptance
-The tree has meeting-level cleanup, not the locked segment enrichment/Neon sync/Worker MCP system (`speech/MeetingStage.kt:70–125`, `data/AppDatabase.kt:306`). Those need separately approved small implementation designs; their build effort is NOT hidden inside increment 8. Do not relabel local-ASR success as full M1 ship.
-1. Scripted mic conversation → enrichment (including Wallei→Walley) → Neon → `search_ranges`/`fetch_range`: every expected verbatim segment/citation/time arrives within TTV; agent answer is quote-grounded.
-2. Two seeded sessions → “status on X?” produces verbatim quotes and resolvable, exact-time citations, not paraphrase-only answers.
-3. Terms absent from enrichment → persisted zero-hit counters; no vector implementation substituted.
-4. Kill mid-capture, airplane mode mid-sync, reboot → device↔Neon reconciliation; unauthenticated MCP rejected and user A cannot read user B. Extend increment 7's file/coverage checks, not row-count-only equivalence.
-5. `pg_dump` → empty stock Postgres restore → identical query results.
-Other M1 blockers need approved follow-up designs: `AndroidManifest.xml:17` enables backup, `AppContainer.kt:33` uses 14 days and `SessionRepository.applyRetention` deletes transcripts, contrary to 30-day audio/transcripts-forever; encryption/consent/export remain release checks. Clarify §1's blanket no-audio-egress versus opt-in BYOK and §2's `raw_text` sync/provenance ambiguity before implementing those paths.
+### 8. Qualification (old increment 8, updated)
+Same structure, new path: held-out consented corpus, human-scored WER with S/D/I/N and the ≤10% local gate UNCHANGED, energy 1–3%/hr VAD-gated capture, integrity/visibility fault injection, plus foreground catch-up rate and quota-handling e2e proofs. Pixel 10 results do not certify Pixel 11. No automatic corpus upload; no private fixture commits. Measurement-only results do not authorize shipping.
+
+## Parked (retained, not deleted; re-activation needs new approval)
+- androidTest `pipeline/SherpaAsrBenchmarkAdapter.kt`, `pipeline/CpuFirstBenchmarkTest.kt`; `libs/sherpa-onnx-1.12.27.aar` (androidTestImplementation dep); `scripts/run-cpu-benchmark.sh`; `scripts/push-local-models.sh` artifact pins; `benchmark-results/` (gitignored).
+- Production Parakeet path: `pipeline/ParakeetAsrEngine.kt`, `pipeline/NativeEngineGate.kt` (+ tests), `ParakeetLocalModels`, LiteRT/jlibrosa deps, `U/` reference sources. The native-lifecycle contract stays live as the capture/future-native discipline (increment 1).
 
 ## Sources
-
-[3] https://ai.google.dev/edge/litert/next/npu
-[4] https://alejandrocordon.com/blog/2026/07/19/whisper-parakeet-on-device-in-production
-[8] https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/raw/main/README.md
-
-## Recommendation and decisions for Varun
-Recommend CPU-first, fidelity-first local proof. Re-baseline the freemium gate only through an evidence-backed product decision after stable, human-scored runs: separate reliability from domain-specific accuracy; do NOT adopt guessed “≤25% loud” or claim ≤10% is impossible from AMI alone. Until approved, ≤10% local and every other locked gate still apply; otherwise defer shipping. Paid/cloud fallback is not a freemium pass.
-1. Approve the early sherpa CPU comparison and one-day NPU investigation cap, with no production NPU fast path unless it earns its place on measured reliability/energy.
-2. Approve the human-reference/held-out corpus and its intended ambient conditions; after results, retain ≤10% or explicitly approve supported-domain thresholds/claims. No post-hoc cherry-picking or weakened privacy/failure-visibility bar.
-3. Approve a named “local reliability proof” checkpoint while separately scoping missing full-M1 prerequisites, or require those prerequisites first. Neither choice silently removes architecture §6 gates or authorizes an ASR-only release.
+- Official: https://developers.google.com/ml-kit/genai/speech-recognition/android
+- Official overview (quotas/foreground): https://developers.google.com/ml-kit/genai
+- Error codes: https://developers.google.com/android/reference/com/google/mlkit/genai/common/GenAiException.ErrorCode
+- Sample: https://github.com/googlesamples/mlkit/tree/master/android/speech
+- Prior art on quotas measured against bytecode: https://github.com/NagaYu/aicore-radar (cross-check only — primary source is Google's reference above)
+- Earlier plan sources: [3] https://ai.google.dev/edge/litert/next/npu · [4] https://alejandrocordon.com/blog/2026/07/19/whisper-parakeet-on-device-in-production · [8] https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/raw/main/README.md
