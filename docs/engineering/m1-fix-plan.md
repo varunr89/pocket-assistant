@@ -1,0 +1,34 @@
+# M1 Fix Plan — On-Device Transcription Reliability (research-based)
+
+Status: PROPOSAL. Research + refined fix plan only; no code changes, nothing committed. Orchestrator gates approval; fixes then land as small increments (product-development-workflow).
+
+## (a) Research: what the ecosystem says (sources cited inline)
+
+- Concurrency: whisper.h is explicit — a whisper_context must not be used by multiple threads concurrently; every production Android port pins inference to one dedicated single-thread dispatcher and queues jobs. sherpa-onnx recognizer/VAD are likewise not thread-safe; shared-singleton use is a known crash class (whisper.cpp#341; whisper.android example + ProAndroidDev on-device Whisper article; sherpa-onnx#2334).
+- LiteRT NPU on Google Tensor is young/fragile: open issue documents SIGSEGV under strict NPU mode and dispatcher/runtime protocol mismatch on Pixel 10 Pro XL; AOT compiler SIGABRTs on non-G5 targets; NPU runtime .so archives only shipped with select releases (v2.1.1, v2.1.5) — dispatcher .so and litert runtime MUST be version-matched. LiteRT has built-in fallback priority lists (NPU→GPU→CPU) and per-op CPU fallback, but npuOnly=true disables all of it (LiteRT#7787; Tensor SDK FAQs; ai.google.dev/edge/litert/next/npu).
+- Preprocessing: Parakeet's documented streaming config is 2 s chunk + 2 s right-context + 10 s left-context @ 16 kHz mono PCM16, and guidance says keep REAL recorded audio including silence — trimming replaces true acoustic context with damage. Speed perturbation is only known as training augmentation at 0.9/1.0/1.1; even strong cloud models gain 1–3 WER pts at 1.2–1.3× and degrade steeply beyond. Our 1.35× + aggressive trim feed the model out-of-distribution input (parakeet-tdt-0.6b-v3 card + NeMo buffered-inference docs; Ko et al. 2015 INTERSPEECH; OpenAI forum speed-vs-WER bench).
+- Reference WER of this exact model family: leaderboard mean 6.3%, but meetings (AMI) 11.4%, Earnings-22 11.4%, GigaSpeech 9.6% — even reference pipelines do NOT clear 10% on real meeting audio; AMI at SNR-5 ≈ 19%. Ambient phone capture is harder than AMI (HF model card; Open ASR Leaderboard).
+- Precedent: production Android on-device Parakeet today = sherpa-onnx CPU int8 (~640 MB, Anotta); Omi ambient capture is cloud STT (Groq Whisper / backend Parakeet); Rewind is Apple-only. We found no production app running Parakeet on LiteRT-NPU — we are early adopters of a beta stack (alejandrocordon.com on-device lessons; docs.omi.me).
+
+## (b) Fix plan (crash class first, then quality, then hygiene)
+
+- F1 — Serialize engine use; never close an in-use handle. ParakeetAsrEngine.kt: add kotlinx Mutex around the whole transcribe body; make close() lifecycle-owned and DELETE the flake-path close at :197-203 (with the mutex held, a reload is safe; without F1 it is the SIGSEGV source). ParakeetAsrProvider (CloudAndLocalProviders.kt:577) keeps the lazy singleton; the mutex makes it single-flight across all AsrWorkers. Why: kills confirmed crash class (4 tombstones, crash-loop). Risk low, effort S.
+- F2 — NPU flake handling: per-window CPU re-run instead of NPU reload; persist flake counters. ParakeetAsrEngine.kt:188-204: on window flake (1) log with LiteRT verbose + SoC/firmware once/day, (2) re-run that window via a CPU CompiledModel (CPU_MODEL already shipped) instead of reloading the 1.3 GB NPU model — reload resets decoder state mid-utterance and is the current behavior, (3) if flake rate ≥ ~30% of windows or 3 consecutive, degrade rest of file to CPU; persist per-device/day counters (prefs/DB) and start future files on CPU when yesterday flaked. Drop npuOnly=true; use fallback priority so partial delegation works. Why: 22–35% of windows currently return empty mid-utterance; each reload costs 2–4 s. Risk low-med (CPU RTF worse: expect ~0.8–1.5× vs NPU 0.2–0.33; NPU stays the fast path). Effort S–M.
+- F3 — Quality ablation matrix (highest-value measurement). AsrAudioPreprocessor (DEFAULT_SPEED 1.35→1.0; trim on/off) × window config (5 s/2 s overlap vs model-card 2 s chunk + 2 s right + 10 s left context) × {clean, loud, silent} over the saved WAVs; WER vs cloud refs AND human refs. Research strongly predicts trim-off + speed-1.0 recovers most of the 47–85% gap. Risk none, effort S.
+- F4 — Local empty → SKIPPED_SILENCE. ParakeetAsrProvider.transcribe (CloudAndLocalProviders.kt:581-585): return AsrResult(plain="", providerId="$id:empty") instead of error(); AsrStage.kt:59-62 already maps blank→SKIPPED_SILENCE. Why: cloud parity, ends 3-retry churn + false FAILED + NPU waste on silent files. Risk none, effort XS.
+- F5 — Fix chunk-seconds arithmetic. CloudAndLocalProviders.kt:470 and :498: seconds = bytes / 32_000 (16 kHz × 2 B); current formula is off 62.5×. Cosmetic, effort XS.
+- F6 (new) — Version/dispatcher pinning + crash visibility. Pin litert (2.1.6 today) and libLiteRtDispatch_GoogleTensor.so to a matched, provenance-checked pair (mismatch ⇒ SIGSEGV per LiteRT#7787); verify .so provenance; add on-next-launch native-crash trace via ApplicationExitInfo (API 30+) so SIGSEGVs surface in-app (failure-visibility SLO); NPU self-test at engine init (1 s window) with CPU-start fallback. Risk low, effort S.
+
+## (c) Honest achievable-WER assessment
+
+- Reference ceiling: this model family scores ~11.4% WER on AMI meeting audio in ideal conditions; ambient far-field phone capture is harder. Even with all fixes, RELIABLE ≤10% on loud/room audio is not realistic for Parakeet 0.6B int8 on this stack; honest band post-fixes: ~10–15% on clean close audio, ~15–30% on loud/far-field. int8 quantization + beta NPU stack only subtract from the fp16 reference numbers.
+- The 47–85% measured is dominated by fixable damage (flakes+reload, trim+1.35×, decoder resets) — expect a large relative improvement, but the ≤10% SLO will likely still fail on hard audio, and M1's freemium gate should be re-baselined against post-fix measurements, not assumed.
+- Fallback if the gap stands: paid tier (BYOK cloud, ≤5%) is the accuracy tier; freemium's honest claim becomes private + zero-cost + good-enough, OR hybrid local-first with opt-in cloud re-run on empty/low-confidence results (privacy tradeoff — Varun's call).
+
+## (d) Open decisions for Varun
+
+1. Freemium SLO shape: accept data-driven redefinition (≤10% clean, ≤25% loud) vs hybrid cloud fallback (breaks pure-privacy story) vs defer M1's local gate?
+2. Plan-B engine: on-device benchmark sherpa-onnx Parakeet int8 CPU (production-proven on Android) against LiteRT-NPU before investing more in the NPU path.
+3. Human reference transcripts for the 3–5 test WAVs — cloud refs are proxies; honest WER needs them.
+4. Unplugged battery-drain test still pending (SLO gate).
+5. Approve F1 + F4 + F5 as increment 1 (XS–S, unblocks everything); F2/F3/F6 follow as measurement lands.
