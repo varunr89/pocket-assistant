@@ -1,5 +1,6 @@
 package com.varun.pocketassistant.capture
 
+import java.time.DayOfWeek
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.ZoneId
@@ -130,6 +131,7 @@ class CaptureScheduleGateTest {
             backgroundScope,
             MutableStateFlow(WeeklyCaptureSchedule()),
         ) { instant }
+        runCurrent() // let both gates observe their schedule before checking
         assertTrue(laGate.isOpenNow()) // 16:30 Monday in LA — window open
         assertFalse(utcGate.isOpenNow()) // 23:30 Monday in UTC — window closed
     }
@@ -173,5 +175,38 @@ class CaptureScheduleGateTest {
         advanceTimeBy(1_100) // <= 1 poll round of waiting
         runCurrent()
         assertEquals(true, opened)
+    }
+
+    // ---- load semantics (B2): the gate starts CLOSED until the saved
+    // schedule is observed, never default-open ----
+
+    @Test
+    fun closedSavedScheduleNeverFlashesOpenBeforeLoad() = runTest {
+        // Tuesday 12:00. The DEFAULT schedule (Mon-Fri 08:00-17:00) is OPEN
+        // here, but the SAVED schedule (Monday only) is CLOSED. Before the
+        // Room flow emits, the gate must report CLOSED — never fall back to
+        // the default and flash the mic open.
+        val now = at(monday.plusDays(1), LocalTime.of(12, 0))
+        val saved = WeeklyCaptureSchedule(
+            weekdays = setOf(DayOfWeek.MONDAY),
+            startMinuteOfDay = 8 * 60,
+            endMinuteOfDay = 17 * 60,
+        )
+        val schedule = MutableStateFlow(saved)
+        val gate = gate(backgroundScope, schedule) { now }
+        assertFalse(gate.isOpenNow()) // not loaded yet -> closed, not default-open
+        runCurrent()
+        assertFalse(gate.isOpenNow()) // loaded: Tuesday is not in the Monday-only schedule
+    }
+
+    @Test
+    fun awaitLoadedCompletesAfterFirstEmission() = runTest {
+        val now = at(monday, LocalTime.of(12, 0))
+        val schedule = MutableStateFlow(WeeklyCaptureSchedule())
+        val gate = gate(backgroundScope, schedule) { now }
+        var loaded = false
+        backgroundScope.launch { gate.awaitLoaded(); loaded = true }
+        runCurrent()
+        assertTrue(loaded)
     }
 }

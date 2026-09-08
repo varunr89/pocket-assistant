@@ -9,7 +9,7 @@ import org.junit.Test
  * Boot re-arm policy (L1 boot-receiver fix, QA run 2026-09-08): the pure
  * "should the boot path re-start the capture service" decision over the
  * persisted schedule. BootReArmReceiver.onReceive itself is
- * Android-framework-bound (broadcast + AlarmManager wiring) and is not
+ * Android-framework-bound (broadcast + notification wiring) and is not
  * unit-testable on the JVM without Robolectric — the receiver delegates
  * every schedule decision to this policy, so pinning it pins the receiver's
  * behavior: an ON schedule re-arms the service start, an OFF schedule

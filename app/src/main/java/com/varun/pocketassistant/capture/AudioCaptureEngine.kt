@@ -90,7 +90,12 @@ class AudioCaptureEngine(
                 // Gate-aware initial publish: starting outside the schedule
                 // must surface as SCHEDULED_OFF immediately (mic released),
                 // never as a transient LISTENING before the loop closes the
-                // gate a few ms later.
+                // gate a few ms later. Await the persisted schedule first
+                // (B2): the gate starts CLOSED until the saved schedule is
+                // observed, so the first decision is against the SAVED
+                // schedule — a non-default schedule that is closed right now
+                // can never flash the mic open against the default.
+                gate.awaitLoaded()
                 val gateOpen = gate.isOpenNow()
                 phase = if (gateOpen) CapturePhase.LISTENING else CapturePhase.SCHEDULED_OFF
                 pushEvent(if (gateOpen) "Capture started" else "Capture started — outside schedule, mic off")
