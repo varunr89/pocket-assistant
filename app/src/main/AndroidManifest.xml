@@ -11,6 +11,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:name=".PocketAssistantApp"
@@ -64,6 +65,24 @@
         <service
             android:name=".speech.TranscriptionDrainService"
             android:exported="false" />
+
+        <!-- L1 boot re-arm: schedule-gated capture resumes at FIRST UNLOCK
+             after a reboot (Varun's decision — never before unlock, so NO
+             directBootAware). LOCKED_BOOT_COMPLETED is delivered to non-
+             directBootAware components only once the device is unlocked;
+             BOOT_COMPLETED is the documented "device booted AND user has
+             unlocked" signal for background apps (credential-less devices
+             unlock automatically, so it fires right after boot there).
+             Both hits are idempotent (single deferred alarm). Protected
+             system broadcasts (RECEIVE_BOOT_COMPLETED). -->
+        <receiver
+            android:name=".capture.BootReArmReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
         <!-- WorkManager FGS: must declare dataSync for setForeground() on API 34+. -->
         <service
